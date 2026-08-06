@@ -30,6 +30,8 @@ export type TestReflection = {
 };
 
 export const V3_OBSERVATIONS_RECORDED = "om.observations.recorded";
+export const V3_OBSERVER_COMPLETED = "om.observer.completed";
+export const V3_OBSERVER_FAILED = "om.observer.failed";
 export const V3_REFLECTIONS_RECORDED = "om.reflections.recorded";
 export const V3_OBSERVATIONS_DROPPED = "om.observations.dropped";
 export const V3_FOLDED = "om.folded";
@@ -165,6 +167,54 @@ export function observationsRecordedEntry(
 		timestamp: DEFAULT_TIMESTAMP,
 		customType: V3_OBSERVATIONS_RECORDED,
 		data: args,
+		...overrides,
+	};
+}
+
+export function observerCompletedEntry(
+	id: string,
+	coversUpToId: string,
+	overrides: Partial<TestEntry> = {},
+): TestEntry {
+	return {
+		type: "custom",
+		id,
+		parentId: null,
+		timestamp: DEFAULT_TIMESTAMP,
+		customType: V3_OBSERVER_COMPLETED,
+		data: { outcome: "empty", coversUpToId },
+		...overrides,
+	};
+}
+
+export function observerFailedEntry(
+	id: string,
+	args: {
+		reason?: "no_structured_outcome" | "rejected_observations" | "stream_error" | "execution_error";
+		coversUpToId: string;
+		coverageId?: string;
+		failedAt?: number;
+		retryAt?: number;
+		consecutiveFailures?: number;
+		detail?: string;
+	},
+	overrides: Partial<TestEntry> = {},
+): TestEntry {
+	return {
+		type: "custom",
+		id,
+		parentId: null,
+		timestamp: DEFAULT_TIMESTAMP,
+		customType: V3_OBSERVER_FAILED,
+		data: {
+			reason: args.reason ?? "no_structured_outcome",
+			coversUpToId: args.coversUpToId,
+			...(args.coverageId ? { coverageId: args.coverageId } : {}),
+			failedAt: args.failedAt ?? 1_000,
+			retryAt: args.retryAt ?? 31_000,
+			consecutiveFailures: args.consecutiveFailures ?? 1,
+			...(args.detail ? { detail: args.detail } : {}),
+		},
 		...overrides,
 	};
 }

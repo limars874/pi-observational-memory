@@ -114,7 +114,7 @@ describe("runObserver", () => {
 	it("puts the current local time after prior memory so the memory stays a cacheable prefix", async () => {
 		let userText = "";
 		const loop = fakeAgentLoop((prompts) => {
-			userText = prompts[0]?.content?.[0]?.text ?? "";
+			if (!userText) userText = prompts[0]?.content?.[0]?.text ?? "";
 		});
 
 		await runObserver({
@@ -138,10 +138,12 @@ describe("runObserver", () => {
 			});
 		});
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const outcome = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0]).toMatchObject({
+		expect(outcome.kind).toBe("recorded");
+		if (outcome.kind !== "recorded") throw new Error("expected recorded outcome");
+		expect(outcome.observations).toHaveLength(1);
+		expect(outcome.observations[0]).toMatchObject({
 			content,
 			timestamp: "2026-05-02 10:30",
 			relevance: "high",
@@ -149,17 +151,22 @@ describe("runObserver", () => {
 			// tokenCount is code-computed from the full rendered line (id + timestamp + relevance + content).
 			tokenCount: 18,
 		});
-		expect(observations?.[0].id).toMatch(/^[a-f0-9]{12}$/);
+		expect(outcome.observations[0].id).toMatch(/^[a-f0-9]{12}$/);
 	});
 
-	it("rejects invented source ids and returns no observations", async () => {
+	it("rejects invented source ids as a structured failure", async () => {
 		const loop = fakeAgentLoop(async (_prompts, context) => {
 			await context.tools[0].execute("tool-1", {
 				observations: [{ timestamp: "2026-05-02 10:30", content: "Bad source", relevance: "medium", sourceEntryIds: ["missing"] }],
 			});
 		});
 
-		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toEqual({
+			kind: "failed",
+			reason: "rejected_observations",
+			attempts: 1,
+			rejected: 1,
+		});
 	});
 
 	it("dedupes deterministic ids", async () => {
@@ -172,15 +179,22 @@ describe("runObserver", () => {
 			});
 		});
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const outcome = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0].content).toBe("Same content");
+		expect(outcome.kind).toBe("recorded");
+		if (outcome.kind !== "recorded") throw new Error("expected recorded outcome");
+		expect(outcome.observations).toHaveLength(1);
+		expect(outcome.observations[0].content).toBe("Same content");
 	});
 
-	it("returns undefined when no tool call records observations", async () => {
+	it("returns a durable failure when no tool call records observations", async () => {
 		const loop = fakeAgentLoop(() => {});
-		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toEqual({
+			kind: "failed",
+			reason: "no_structured_outcome",
+			attempts: 2,
+			rejected: 0,
+		});
 	});
 
 	it("throws ObserverStreamError when the stream errors with nothing recorded", async () => {
@@ -200,10 +214,12 @@ describe("runObserver", () => {
 			});
 		}, [assistantEndEvent("error", "gateway timeout")]);
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const outcome = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0].content).toBe("Kept despite later error");
+		expect(outcome.kind).toBe("recorded");
+		if (outcome.kind !== "recorded") throw new Error("expected recorded outcome");
+		expect(outcome.observations).toHaveLength(1);
+		expect(outcome.observations[0].content).toBe("Kept despite later error");
 	});
 
 	it("uses finishTurn as an observer turn cap without overriding hard exits", async () => {

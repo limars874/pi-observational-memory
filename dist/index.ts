@@ -279,11 +279,22 @@ function loadConfig(cwd, env = process.env) {
 
 // src/session-ledger/types.ts
 var OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
+var OM_OBSERVER_COMPLETED = "om.observer.completed";
+var OM_OBSERVER_FAILED = "om.observer.failed";
 var OM_REFLECTIONS_RECORDED = "om.reflections.recorded";
 var OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
 var OM_FOLDED = "om.folded";
 var RELEVANCE_VALUES = ["low", "medium", "high", "critical"];
 var MEMORY_ID_PATTERN = /^[a-f0-9]{12}$/;
+var OBSERVER_FAILURE_BACKOFF_BASE_MS = 3e4;
+var OBSERVER_FAILURE_BACKOFF_MAX_MS = 15 * 6e4;
+var OBSERVER_FAILURE_DETAIL_MAX_CHARS = 2e3;
+var OBSERVER_FAILURE_REASONS = [
+  "no_structured_outcome",
+  "rejected_observations",
+  "stream_error",
+  "execution_error"
+];
 function isRelevance(value) {
   return typeof value === "string" && RELEVANCE_VALUES.includes(value);
 }
@@ -298,6 +309,9 @@ function isMemoryId(value) {
 }
 function isTokenCount(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+function isObserverFailureReason(value) {
+  return typeof value === "string" && OBSERVER_FAILURE_REASONS.includes(value);
 }
 function isPlainRecord(value) {
   return !!value && typeof value === "object";
@@ -314,6 +328,14 @@ function isObservationsRecordedData(value) {
   if (!isPlainRecord(value)) return false;
   return Array.isArray(value.observations) && value.observations.length > 0 && value.observations.every(isObservation) && isNonEmptyString(value.coversUpToId);
 }
+function isObserverCompletedData(value) {
+  if (!isPlainRecord(value)) return false;
+  return value.outcome === "empty" && isNonEmptyString(value.coversUpToId);
+}
+function isObserverFailedData(value) {
+  if (!isPlainRecord(value)) return false;
+  return isObserverFailureReason(value.reason) && isNonEmptyString(value.coversUpToId) && (value.coverageId === void 0 || isNonEmptyString(value.coverageId)) && typeof value.failedAt === "number" && Number.isFinite(value.failedAt) && value.failedAt >= 0 && typeof value.retryAt === "number" && Number.isFinite(value.retryAt) && value.retryAt >= value.failedAt && value.retryAt - value.failedAt <= OBSERVER_FAILURE_BACKOFF_MAX_MS && typeof value.consecutiveFailures === "number" && Number.isInteger(value.consecutiveFailures) && value.consecutiveFailures >= 1 && (value.detail === void 0 || isNonEmptyString(value.detail) && value.detail.length <= OBSERVER_FAILURE_DETAIL_MAX_CHARS);
+}
 function isReflectionsRecordedData(value) {
   if (!isPlainRecord(value)) return false;
   return Array.isArray(value.reflections) && value.reflections.length > 0 && value.reflections.every(isReflection) && isNonEmptyString(value.coversUpToId);
@@ -329,6 +351,12 @@ function isMemoryDetails(value) {
 function isObservationsRecordedEntry(entry) {
   return entry.type === "custom" && entry.customType === OM_OBSERVATIONS_RECORDED && isObservationsRecordedData(entry.data);
 }
+function isObserverCompletedEntry(entry) {
+  return entry.type === "custom" && entry.customType === OM_OBSERVER_COMPLETED && isObserverCompletedData(entry.data);
+}
+function isObserverFailedEntry(entry) {
+  return entry.type === "custom" && entry.customType === OM_OBSERVER_FAILED && isObserverFailedData(entry.data);
+}
 function isReflectionsRecordedEntry(entry) {
   return entry.type === "custom" && entry.customType === OM_REFLECTIONS_RECORDED && isReflectionsRecordedData(entry.data);
 }
@@ -338,6 +366,13 @@ function isObservationsDroppedEntry(entry) {
 function buildObservationsRecordedData(observations, coversUpToId) {
   if (observations.length === 0 || !isNonEmptyString(coversUpToId)) return void 0;
   return { observations, coversUpToId };
+}
+function buildObserverCompletedData(coversUpToId) {
+  if (!isNonEmptyString(coversUpToId)) return void 0;
+  return { outcome: "empty", coversUpToId };
+}
+function buildObserverFailedData(data) {
+  return isObserverFailedData(data) ? data : void 0;
 }
 function buildReflectionsRecordedData(reflections, coversUpToId) {
   if (reflections.length === 0 || !isNonEmptyString(coversUpToId)) return void 0;
@@ -376,6 +411,28 @@ function isValidCoverageEntry(entry, customType) {
   if (customType === OM_REFLECTIONS_RECORDED) return isNonEmptyArray(entry.data.reflections);
   return isNonEmptyArray(entry.data.observationIds);
 }
+function observationCoverageBoundary(entries) {
+  const idToIndex = entryIndexById(entries);
+  let latestIndex = -1;
+  let markerId;
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!isObservationsRecordedEntry(entry) && !isObserverCompletedEntry(entry)) continue;
+    const coveredIndex = idToIndex.get(entry.data.coversUpToId);
+    if (coveredIndex === void 0 || coveredIndex >= i || !isSourceEntry(entries[coveredIndex])) continue;
+    if (coveredIndex > latestIndex) {
+      latestIndex = coveredIndex;
+      markerId = entry.data.coversUpToId;
+    }
+  }
+  return { index: latestIndex, markerId };
+}
+function latestObservationCoverageIndex(entries) {
+  return observationCoverageBoundary(entries).index;
+}
+function latestObservationCoverageMarkerId(entries) {
+  return observationCoverageBoundary(entries).markerId;
+}
 function latestCoverageIndex(entries, customType) {
   const idToIndex = entryIndexById(entries);
   let latest = -1;
@@ -402,6 +459,21 @@ function latestCoverageMarkerId(entries, customType) {
   }
   return latestMarkerId;
 }
+function latestObserverFailureForCoverage(entries, coverageId) {
+  const idToIndex = entryIndexById(entries);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!isObserverFailedEntry(entry) || entry.data.coverageId !== coverageId) continue;
+    const attemptedThroughIndex = idToIndex.get(entry.data.coversUpToId);
+    if (attemptedThroughIndex === void 0 || attemptedThroughIndex >= i || !isSourceEntry(entries[attemptedThroughIndex])) continue;
+    if (coverageId !== void 0) {
+      const coverageIndex2 = idToIndex.get(coverageId);
+      if (coverageIndex2 === void 0 || coverageIndex2 >= attemptedThroughIndex || !isSourceEntry(entries[coverageIndex2])) continue;
+    }
+    return entry.data;
+  }
+  return void 0;
+}
 function earlierCoverageMarkerId(entries, firstId, secondId) {
   if (!firstId) return secondId;
   if (!secondId) return firstId;
@@ -419,15 +491,12 @@ function rawTokensAfterIndex(entries, index) {
   }
   return total;
 }
-function rawTokensSinceCoverage(entries, customType) {
-  return rawTokensAfterIndex(entries, latestCoverageIndex(entries, customType));
-}
 function rawTokensSinceObservationCoverage(entries) {
-  return rawTokensSinceCoverage(entries, OM_OBSERVATIONS_RECORDED);
+  return rawTokensAfterIndex(entries, latestObservationCoverageIndex(entries));
 }
 function observedTokensSinceReflectionCoverage(entries) {
   const reflectionIndex = latestCoverageIndex(entries, OM_REFLECTIONS_RECORDED);
-  const observationIndex = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+  const observationIndex = latestObservationCoverageIndex(entries);
   if (observationIndex <= reflectionIndex) return 0;
   let total = 0;
   for (let i = reflectionIndex + 1; i <= observationIndex; i++) {
@@ -474,7 +543,7 @@ function realContextTokensAtCoverage(entries, coverageIdx) {
   return void 0;
 }
 function realTokensSinceAnchor(entries, customType, currentContextTokens) {
-  const coverageIdx = customType ? latestCoverageIndex(entries, customType) : -1;
+  const coverageIdx = customType === OM_OBSERVATIONS_RECORDED ? latestObservationCoverageIndex(entries) : customType ? latestCoverageIndex(entries, customType) : -1;
   const compactionIdx = findLastCompactionIndex(entries);
   if (compactionIdx > coverageIdx) {
     const baseline = realContextTokensAfterCompaction(entries, compactionIdx);
@@ -501,7 +570,7 @@ function rawTokensSinceLastCompaction(entries) {
 }
 function observedTokensSinceLastCompaction(entries) {
   const start = compactionRangeStartIndex(entries);
-  const coverageIndex2 = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+  const coverageIndex2 = latestObservationCoverageIndex(entries);
   if (coverageIndex2 < start) return 0;
   let total = 0;
   for (let i = start; i <= coverageIndex2; i++) {
@@ -510,7 +579,7 @@ function observedTokensSinceLastCompaction(entries) {
   return total;
 }
 function unobservedSourceSpanBefore(entries, cutIndex) {
-  const coverageIndex2 = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+  const coverageIndex2 = latestObservationCoverageIndex(entries);
   const start = Math.max(coverageIndex2 + 1, compactionRangeStartIndex(entries));
   let firstIndex = -1;
   let lastIndex = -1;
@@ -1362,7 +1431,7 @@ How you work:
 2. Read the conversation chunk and identify what new information it contains.
 3. Call record_observations with a batch covering part (or all) of the chunk.
 4. Read the progress receipt. If content remains uncovered, call again. You may call the tool many times.
-5. When the chunk is fully covered, STOP calling the tool and reply with a brief plain-text confirmation (one short sentence). That ends the run.
+5. When the chunk is fully covered, stop. If the chunk warrants zero new observations, you MUST still call record_observations once with {"observations": []}. Plain-text confirmation without a tool call is a failed outcome.
 
 What to emit:
 - Produce NEW observations for the new chunk only. Do not restate facts already present in reflections or current observations unless something has materially changed.
@@ -1371,7 +1440,7 @@ What to emit:
 - Never invent source entry ids. Use only ids printed in the chunk. If an observation spans multiple turns or tool results, include every supporting source entry id.
 - Observations with missing, empty, or invalid sourceEntryIds will be rejected and not recorded, so do not call record_observations until you can cite valid source ids.
 - Group repeated similar tool calls into a single observation rather than one per call.
-- Skip routine, low-information events. It is fine to emit zero observations if the chunk carries no new information \u2014 in that case, simply do not call the tool and end with a plain-text confirmation.
+- Skip routine, low-information events. It is fine to emit zero observations if the chunk carries no new information. In that case, call record_observations with an empty observations array so the empty verdict is explicit and durable.
 
 Observation content rules:
 
@@ -1463,7 +1532,7 @@ Do NOT default to "critical" or "high". Most observations are medium or low. Res
 
 Timestamp format: "YYYY-MM-DD HH:MM" (local time, 24-hour, to the minute). This goes in the timestamp field, not the content.
 
-Remember: these observations are the assistant's ONLY memory of this chunk once the raw messages fall out of context. Make them count.`;
+Remember: these observations are the assistant's ONLY memory of this chunk once the raw messages fall out of context. Every run must end with a structured record_observations outcome, including an explicit empty array when there is nothing to record. Make them count.`;
 
 // src/serialize.ts
 function pad(n) {
@@ -1689,7 +1758,7 @@ var RecordObservationsSchema = Type.Object({
         }
       )
     }),
-    { description: "Batch of new observations. May be empty only if the tool is not called at all." }
+    { description: "Batch of new observations. Use an empty array to explicitly confirm that the chunk warrants no new observations." }
   )
 });
 var ObserverStreamError = class extends Error {
@@ -1716,16 +1785,32 @@ function normalizeSourceEntryIds(sourceEntryIds, allowedSourceEntryIds) {
   return Array.from(seen).sort((a, b) => (allowedOrder.get(a) ?? 0) - (allowedOrder.get(b) ?? 0));
 }
 async function runObserver(args) {
-  const { model, apiKey, headers, env, priorReflections, priorObservations, chunk, allowedSourceEntryIds, signal } = args;
+  const {
+    model,
+    apiKey,
+    headers,
+    env,
+    priorReflections,
+    priorObservations,
+    chunk,
+    allowedSourceEntryIds,
+    signal,
+    modelRegistry,
+    streamSimple
+  } = args;
   const conversation = chunk.trim();
-  if (!conversation) return void 0;
+  if (!conversation) return { kind: "failed", reason: "no_structured_outcome", attempts: 0, rejected: 0 };
   const accumulated = /* @__PURE__ */ new Map();
+  let activeAttempt;
   const recordObservations = {
     name: "record_observations",
     label: "Record observations",
-    description: "Record a batch of new observations distilled from the conversation chunk. Call this multiple times as you work through the chunk. Stop calling when coverage is complete, then emit a short plain-text confirmation to end the run.",
+    description: "Record a batch of new observations distilled from the conversation chunk. Call this multiple times as needed. If the chunk warrants no new observations, call once with an empty observations array; plain text alone is not a valid outcome.",
     parameters: RecordObservationsSchema,
     execute: async (_id, params) => {
+      if (!activeAttempt) throw new Error("record_observations called outside an observer attempt");
+      activeAttempt.toolCalls++;
+      if (params.observations.length === 0) activeAttempt.explicitEmpty = true;
       let added = 0;
       let duplicates = 0;
       let rejected = 0;
@@ -1756,8 +1841,9 @@ async function runObserver(args) {
         });
         added++;
       }
+      activeAttempt.rejected += rejected;
       const rejectedPart = rejected > 0 ? ` ${rejected} observation${rejected === 1 ? "" : "s"} rejected for missing or invalid sourceEntryIds.` : "";
-      const ack = `Recorded ${added} new observation${added === 1 ? "" : "s"} ` + (duplicates > 0 ? `(${duplicates} duplicate${duplicates === 1 ? "" : "s"} skipped).` : ".") + rejectedPart + ` Total so far this run: ${accumulated.size}. Continue if the chunk still has uncovered content; otherwise stop calling the tool and emit a short plain-text confirmation.`;
+      const ack = params.observations.length === 0 ? "Explicit empty outcome recorded. End the run now." : `Recorded ${added} new observation${added === 1 ? "" : "s"} ` + (duplicates > 0 ? `(${duplicates} duplicate${duplicates === 1 ? "" : "s"} skipped).` : ".") + rejectedPart + ` Total so far this run: ${accumulated.size}. Continue if the chunk still has uncovered content; otherwise end the run.`;
       return { content: [{ type: "text", text: ack }], details: { added, duplicates, rejected, total: accumulated.size } };
     }
   };
@@ -1770,7 +1856,7 @@ ${joinOrEmpty(priorObservations)}
 
 Current local time: ${now}
 
-Compress the following new conversation chunk into observations by calling record_observations one or more times. Do not restate facts already present in current reflections or current observations. Prefer inline conversation timestamps when assigning times; fall back to the current local time above only if no message timestamp applies. Stop calling the tool and reply with a short plain-text confirmation once the chunk is fully covered.
+Compress the following new conversation chunk into observations by calling record_observations one or more times. Do not restate facts already present in current reflections or current observations. Prefer inline conversation timestamps when assigning times; fall back to the current local time above only if no message timestamp applies. If there is nothing new to record, call record_observations with {"observations": []}. A plain-text response without that tool call is a failed outcome.
 
 NEW CONVERSATION CHUNK:
 ${conversation}`;
@@ -1781,53 +1867,83 @@ ${conversation}`;
       timestamp: Date.now()
     }
   ];
-  const context = {
-    messages: [{ role: "system", content: OBSERVER_SYSTEM, timestamp: Date.now() }],
-    tools: [recordObservations]
-  };
   const reasoning = model.reasoning;
   const thinkingLevel = args.thinkingLevel ?? "low";
   const effectiveMaxTurns = args.maxTurns && args.maxTurns > 0 ? args.maxTurns : void 0;
-  let turnCount = 0;
-  const config = {
-    model,
-    apiKey,
-    headers,
-    env,
-    maxTokens: boundedMaxTokens(model, args.maxOutputTokens ?? AGENT_LOOP_MAX_TOKENS),
-    convertToLlm: (msgs) => msgs,
-    toolExecution: "sequential",
-    ...reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {},
-    ...effectiveMaxTurns !== void 0 ? {
-      finishTurn: (turn) => {
-        if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
-        turnCount++;
-        return turnCount >= effectiveMaxTurns ? { action: "end" } : void 0;
-      }
-    } : {}
-  };
   const loop = args.agentLoop ?? agentLoop;
-  const stream = loop(
-    prompts,
-    context,
-    config,
-    signal,
-    resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple)
-  );
-  let streamError;
-  for await (const event of stream) {
-    logAgentStreamError("observer", event);
-    const message = event.message;
-    if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
-      streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+  const runAttempt = async (attemptPrompts) => {
+    const state = { toolCalls: 0, explicitEmpty: false, rejected: 0 };
+    activeAttempt = state;
+    let turnCount = 0;
+    const config = {
+      model,
+      apiKey,
+      headers,
+      env,
+      maxTokens: boundedMaxTokens(model, args.maxOutputTokens ?? AGENT_LOOP_MAX_TOKENS),
+      convertToLlm: (msgs) => msgs,
+      toolExecution: "sequential",
+      ...reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {},
+      ...effectiveMaxTurns !== void 0 ? {
+        finishTurn: (turn) => {
+          if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
+          turnCount++;
+          return turnCount >= effectiveMaxTurns ? { action: "end" } : void 0;
+        }
+      } : {}
+    };
+    const context = {
+      messages: [{ role: "system", content: OBSERVER_SYSTEM, timestamp: Date.now() }],
+      tools: [recordObservations]
+    };
+    let streamError;
+    try {
+      const stream = loop(
+        attemptPrompts,
+        context,
+        config,
+        signal,
+        resolveWorkerStreamSimple(model, modelRegistry, streamSimple)
+      );
+      for await (const event of stream) {
+        logAgentStreamError("observer", event);
+        const message = event.message;
+        if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+          streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+        }
+      }
+      await stream.result();
+      return { state, streamError };
+    } finally {
+      activeAttempt = void 0;
     }
-  }
-  await stream.result();
-  if (accumulated.size === 0) {
+  };
+  const classifyAttempt = (state, streamError, attempts) => {
+    if (accumulated.size > 0) {
+      return { kind: "recorded", observations: Array.from(accumulated.values()), attempts };
+    }
     if (streamError) throw new ObserverStreamError(streamError.stopReason, streamError.errorMessage);
-    return void 0;
-  }
-  return Array.from(accumulated.values());
+    if (state.rejected > 0) {
+      return { kind: "failed", reason: "rejected_observations", attempts, rejected: state.rejected };
+    }
+    if (state.toolCalls > 0 && state.explicitEmpty) return { kind: "empty", attempts };
+    return { kind: "failed", reason: "no_structured_outcome", attempts, rejected: 0 };
+  };
+  const firstAttempt = await runAttempt(prompts);
+  const firstOutcome = classifyAttempt(firstAttempt.state, firstAttempt.streamError, 1);
+  if (firstOutcome.kind !== "failed" || firstOutcome.reason !== "no_structured_outcome") return firstOutcome;
+  const correction = {
+    role: "user",
+    content: [{
+      type: "text",
+      text: `CORRECTIVE RETRY: Your previous response did not produce the required structured outcome. Call record_observations now. Use {"observations": []} if the chunk warrants no new observations; do not answer with plain text only.
+
+${userText}`
+    }],
+    timestamp: Date.now()
+  };
+  const secondAttempt = await runAttempt([correction]);
+  return classifyAttempt(secondAttempt.state, secondAttempt.streamError, 2);
 }
 
 // src/hooks/compaction-catch-up.ts
@@ -1847,7 +1963,7 @@ async function catchUpObserver(args) {
   }
   const contextWindow = resolved.model.contextWindow;
   const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
-  const frontierIndex = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+  const frontierIndex = latestObservationCoverageIndex(entries);
   let remaining = entries.slice(frontierIndex + 1, gap.lastIndex + 1).filter(isSourceEntry);
   let branch = entries;
   for (let chunkIndex = 0; chunkIndex < maxChunks && remaining.length > 0; chunkIndex++) {
@@ -1866,7 +1982,7 @@ async function catchUpObserver(args) {
     debugLog("compaction.catch_up.chunk", { chunkIndex, sourceEntryCount: sourceEntryIds.length, estimatedTokens, coversUpToId });
     let observations;
     try {
-      observations = await runObserver({
+      const outcome = await runObserver({
         model: resolved.model,
         apiKey: resolved.apiKey,
         headers: resolved.headers,
@@ -1881,6 +1997,7 @@ async function catchUpObserver(args) {
         thinkingLevel: runtime.config.model?.thinking ?? "low",
         modelRegistry: ctx.modelRegistry
       });
+      observations = Array.isArray(outcome) ? outcome.length > 0 ? { kind: "recorded", observations: outcome, attempts: 1 } : { kind: "empty", attempts: 1 } : outcome;
     } catch (error) {
       if (signal?.aborted) return { ...result, stoppedBecause: "aborted" };
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1888,14 +2005,29 @@ async function catchUpObserver(args) {
       if (ctx.hasUI) ctx.ui.notify(`Observational memory: catch-up observer failed: ${errorMessage}`, "warning");
       return { ...result, stoppedBecause: "error" };
     }
-    const data = observations && observations.length > 0 ? buildObservationsRecordedData(observations, coversUpToId) : void 0;
+    if (observations.kind === "failed") {
+      debugLog("compaction.catch_up.empty", {
+        chunkIndex,
+        coversUpToId,
+        reason: observations.reason
+      });
+      if (ctx.hasUI) ctx.ui.notify("Observational memory: catch-up observer produced no valid structured outcome", "warning");
+      return { ...result, stoppedBecause: "error" };
+    }
+    if (observations.kind === "empty") {
+      const completed = buildObserverCompletedData(coversUpToId);
+      if (completed) pi.appendEntry(OM_OBSERVER_COMPLETED, completed);
+      debugLog("compaction.catch_up.empty", { chunkIndex, coversUpToId, coverageAdvanced: completed !== void 0 });
+      return { ...result, stoppedBecause: "empty" };
+    }
+    const data = buildObservationsRecordedData(observations.observations, coversUpToId);
     if (!data) {
       debugLog("compaction.catch_up.empty", { chunkIndex, coversUpToId });
       return { ...result, stoppedBecause: "empty" };
     }
     pi.appendEntry(OM_OBSERVATIONS_RECORDED, data);
     result.chunksRecorded++;
-    debugLog("compaction.catch_up.recorded", { chunkIndex, count: observations.length, coversUpToId });
+    debugLog("compaction.catch_up.recorded", { chunkIndex, count: observations.observations.length, coversUpToId });
     const coveredIndex = entries.findIndex((entry) => entry.id === coversUpToId);
     remaining = remaining.filter((entry) => entries.indexOf(entry) > coveredIndex);
     branch = ctx.sessionManager?.getBranch?.() ?? branch;
@@ -2738,6 +2870,12 @@ function sourceEntriesAfter(entries, index) {
 function appendEntry(pi, customType, data) {
   pi.appendEntry(customType, data);
 }
+function normalizeObserverOutcome(outcome) {
+  if (Array.isArray(outcome)) {
+    return outcome.length > 0 ? { kind: "recorded", observations: outcome, attempts: 1 } : { kind: "empty", attempts: 1 };
+  }
+  return outcome ?? { kind: "empty", attempts: 1 };
+}
 function mergeReflections(existing, additional) {
   const seen = new Set(existing.map((reflection) => reflection.id));
   const merged = [...existing];
@@ -2766,8 +2904,16 @@ function stageTokens(entries, customType, currentTokens, rawEstimateFn) {
   const real = currentTokens !== void 0 ? realTokensSinceAnchor(entries, customType, currentTokens) : void 0;
   return real !== void 0 ? Math.max(raw, real) : raw;
 }
+function observerFailureBackoffActive(failure, now = Date.now()) {
+  return failure !== void 0 && now >= failure.failedAt && now < failure.retryAt;
+}
 function anyStageDue(entries, runtime, currentTokens) {
-  return stageDue(entries, runtime, currentTokens, OM_OBSERVATIONS_RECORDED, rawTokensSinceObservationCoverage, runtime.config.observeAfterTokens) || stageDue(entries, runtime, currentTokens, OM_REFLECTIONS_RECORDED, observedTokensSinceReflectionCoverage, runtime.config.reflectAfterTokens);
+  if (stageDue(entries, runtime, currentTokens, OM_OBSERVATIONS_RECORDED, rawTokensSinceObservationCoverage, runtime.config.observeAfterTokens)) {
+    const coverageId = latestObservationCoverageMarkerId(entries);
+    const failure = latestObserverFailureForCoverage(entries, coverageId);
+    return !observerFailureBackoffActive(failure);
+  }
+  return stageDue(entries, runtime, currentTokens, OM_REFLECTIONS_RECORDED, observedTokensSinceReflectionCoverage, runtime.config.reflectAfterTokens);
 }
 function shouldNotifyWorker(runtime, ctx) {
   return runtime.config.showWorkerNotifications && ctx.hasUI;
@@ -2925,6 +3071,49 @@ function debugSessionMetadata(ctx) {
     return {};
   }
 }
+function observerFailureDelayMs(consecutiveFailures) {
+  const exponent = Math.max(0, Math.min(10, consecutiveFailures - 1));
+  return Math.min(OBSERVER_FAILURE_BACKOFF_MAX_MS, OBSERVER_FAILURE_BACKOFF_BASE_MS * 2 ** exponent);
+}
+function observerFailureSummary(reason, detail) {
+  if (reason === "no_structured_outcome") return "observer produced no structured outcome after one corrective retry";
+  if (reason === "rejected_observations") return detail ?? "observer proposals were rejected";
+  if (reason === "stream_error") return detail ?? "observer stream failed";
+  return detail ?? "observer execution failed";
+}
+function recordObserverFailure(pi, runtime, ctx, entries, args) {
+  const previous = latestObserverFailureForCoverage(entries, args.coverageId);
+  const consecutiveFailures = (previous?.consecutiveFailures ?? 0) + 1;
+  const failedAt = Date.now();
+  const delayMs = observerFailureDelayMs(consecutiveFailures);
+  const detail = args.detail?.trim().slice(0, OBSERVER_FAILURE_DETAIL_MAX_CHARS) || void 0;
+  const data = buildObserverFailedData({
+    reason: args.reason,
+    coversUpToId: args.coversUpToId,
+    ...args.coverageId ? { coverageId: args.coverageId } : {},
+    failedAt,
+    retryAt: failedAt + delayMs,
+    consecutiveFailures,
+    ...detail ? { detail } : {}
+  });
+  if (!data) throw new Error("could not build observer failure state");
+  appendEntry(pi, OM_OBSERVER_FAILED, data);
+  debugLog("observer.failed", {
+    reason: data.reason,
+    coversUpToId: data.coversUpToId,
+    coverageId: data.coverageId,
+    consecutiveFailures,
+    retryAt: data.retryAt,
+    detail
+  });
+  const summary = observerFailureSummary(args.reason, detail);
+  const retrySeconds = Math.ceil(delayMs / 1e3);
+  runtime.recordConsolidationStageError(
+    ctx,
+    "observer",
+    new Error(`${summary}; coverage unchanged; retrying after ${retrySeconds} seconds`)
+  );
+}
 function maybeLaunchConsolidation(pi, runtime, ctx) {
   runtime.ensureConfig(ctx.cwd);
   if (runtime.config.passive === true) return void 0;
@@ -2992,17 +3181,15 @@ async function runObserverStage(pi, runtime, ctx, resolver) {
   const entries = ctx.sessionManager.getBranch();
   const tokens = stageTokens(entries, OM_OBSERVATIONS_RECORDED, realContextTokens(ctx), rawTokensSinceObservationCoverage);
   if (tokens < runtime.config.observeAfterTokens) return "continue";
-  const sessionMetadata = debugSessionMetadata(ctx);
-  const sessionIdentity = sessionMetadata.sessionId ?? sessionMetadata.sessionFile;
-  const coverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
-  const backoff = runtime.observerEmptyBackoff;
-  if (backoff) {
-    if (sessionIdentity !== backoff.sessionIdentity || coverageId !== backoff.coverageId || tokens >= backoff.tokensAtEmpty + runtime.config.observeAfterTokens) {
-      runtime.observerEmptyBackoff = void 0;
-    } else {
-      debugLog("observer.empty_backoff", { tokens, resumeAtTokens: backoff.tokensAtEmpty + runtime.config.observeAfterTokens });
-      return "continue";
-    }
+  const coverageId = latestObservationCoverageMarkerId(entries);
+  const failure = latestObserverFailureForCoverage(entries, coverageId);
+  if (observerFailureBackoffActive(failure)) {
+    debugLog("observer.failure_backoff", {
+      reason: failure.reason,
+      consecutiveFailures: failure.consecutiveFailures,
+      retryAt: failure.retryAt
+    });
+    return "abort";
   }
   const resolved = await resolver.resolve("observer");
   if (!resolved) return "abort";
@@ -3010,7 +3197,7 @@ async function runObserverStage(pi, runtime, ctx, resolver) {
     debugLog("observer.aborted", {});
     return "abort";
   }
-  const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+  const lastCoverageIdx = latestObservationCoverageIndex(entries);
   const backlogEntries = sourceEntriesAfter(entries, lastCoverageIdx);
   const contextWindow = observerChunkContextWindow(runtime, ctx, resolved);
   const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
@@ -3052,9 +3239,9 @@ async function runObserverStage(pi, runtime, ctx, resolver) {
     omittedReflections: memory.omittedReflections,
     omittedObservations: memory.omittedObservations
   });
-  let observations;
+  let outcome;
   try {
-    observations = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
+    const rawOutcome = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
       model: worker.model,
       apiKey: worker.apiKey,
       headers: worker.headers,
@@ -3069,37 +3256,56 @@ async function runObserverStage(pi, runtime, ctx, resolver) {
       thinkingLevel: workerThinkingLevel(runtime, worker),
       modelRegistry: ctx.modelRegistry
     }), consolidationSignal(runtime));
+    outcome = normalizeObserverOutcome(rawOutcome);
   } catch (error) {
     if (wasAborted(runtime)) {
       debugLog("observer.aborted", { coversUpToId });
       return "abort";
     }
-    if (error instanceof ObserverStreamError) {
-      runtime.recordConsolidationStageError(ctx, "observer", error);
-      return "abort";
-    }
-    throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    recordObserverFailure(pi, runtime, ctx, entries, {
+      reason: error instanceof ObserverStreamError ? "stream_error" : "execution_error",
+      coversUpToId,
+      coverageId,
+      detail
+    });
+    return "abort";
   }
   if (wasAborted(runtime)) {
     debugLog("observer.aborted", { coversUpToId });
     return "abort";
   }
-  if (!observations || observations.length === 0) {
-    debugLog("observer.empty", { coversUpToId });
-    runtime.observerEmptyBackoff = { sessionIdentity, coverageId, tokensAtEmpty: tokens };
+  if (outcome.kind === "failed") {
+    const detail = outcome.reason === "rejected_observations" ? `observer rejected ${outcome.rejected} proposed observation${outcome.rejected === 1 ? "" : "s"} with invalid sourceEntryIds` : void 0;
+    recordObserverFailure(pi, runtime, ctx, entries, {
+      reason: outcome.reason,
+      coversUpToId,
+      coverageId,
+      detail
+    });
+    return "abort";
+  }
+  if (outcome.kind === "empty") {
+    const data2 = buildObserverCompletedData(coversUpToId);
+    if (!data2) return "continue";
+    runtime.observerEmptyBackoff = void 0;
+    appendEntry(pi, OM_OBSERVER_COMPLETED, data2);
+    debugLog("observer.empty", { coversUpToId, attempts: outcome.attempts, coverageAdvanced: true });
     if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
-      "Observational memory: observer found nothing new in this chunk (coverage unchanged; will retry later)",
+      "Observational memory: observer confirmed nothing new in this chunk (coverage advanced)",
       "info"
     );
     return "continue";
   }
+  const observations = outcome.observations;
   runtime.observerEmptyBackoff = void 0;
   const data = buildObservationsRecordedData(observations, coversUpToId);
   if (!data) return "continue";
   debugLog("observer.records", {
     count: observations.length,
     observationTokens: observations.reduce((sum, observation) => sum + observation.tokenCount, 0),
-    coversUpToId
+    coversUpToId,
+    attempts: outcome.attempts
   });
   appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
   debugLog("observer.appended", { count: observations.length, coversUpToId });

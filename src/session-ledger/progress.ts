@@ -3,7 +3,11 @@ import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
 	OM_REFLECTIONS_RECORDED,
+	isObservationsRecordedEntry,
+	isObserverCompletedEntry,
+	isObserverFailedEntry,
 	type Entry,
+	type ObserverFailedEntryData,
 	type V3MemoryCustomType,
 } from "./types.js";
 
@@ -42,6 +46,33 @@ function isValidCoverageEntry(entry: Entry, customType: V3MemoryCustomType): ent
 	return isNonEmptyArray(entry.data.observationIds);
 }
 
+function observationCoverageBoundary(entries: Entry[]): { index: number; markerId?: string } {
+	const idToIndex = entryIndexById(entries);
+	let latestIndex = -1;
+	let markerId: string | undefined;
+
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		if (!isObservationsRecordedEntry(entry) && !isObserverCompletedEntry(entry)) continue;
+		const coveredIndex = idToIndex.get(entry.data.coversUpToId);
+		if (coveredIndex === undefined || coveredIndex >= i || !isSourceEntry(entries[coveredIndex])) continue;
+		if (coveredIndex > latestIndex) {
+			latestIndex = coveredIndex;
+			markerId = entry.data.coversUpToId;
+		}
+	}
+
+	return { index: latestIndex, markerId };
+}
+
+export function latestObservationCoverageIndex(entries: Entry[]): number {
+	return observationCoverageBoundary(entries).index;
+}
+
+export function latestObservationCoverageMarkerId(entries: Entry[]): string | undefined {
+	return observationCoverageBoundary(entries).markerId;
+}
+
 export function latestCoverageIndex(entries: Entry[], customType: V3MemoryCustomType): number {
 	const idToIndex = entryIndexById(entries);
 	let latest = -1;
@@ -74,6 +105,25 @@ export function latestCoverageMarkerId(entries: Entry[], customType: V3MemoryCus
 	return latestMarkerId;
 }
 
+export function latestObserverFailureForCoverage(
+	entries: Entry[],
+	coverageId: string | undefined,
+): ObserverFailedEntryData | undefined {
+	const idToIndex = entryIndexById(entries);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (!isObserverFailedEntry(entry) || entry.data.coverageId !== coverageId) continue;
+		const attemptedThroughIndex = idToIndex.get(entry.data.coversUpToId);
+		if (attemptedThroughIndex === undefined || attemptedThroughIndex >= i || !isSourceEntry(entries[attemptedThroughIndex])) continue;
+		if (coverageId !== undefined) {
+			const coverageIndex = idToIndex.get(coverageId);
+			if (coverageIndex === undefined || coverageIndex >= attemptedThroughIndex || !isSourceEntry(entries[coverageIndex])) continue;
+		}
+		return entry.data;
+	}
+	return undefined;
+}
+
 export function earlierCoverageMarkerId(entries: Entry[], firstId: string | undefined, secondId: string | undefined): string | undefined {
 	if (!firstId) return secondId;
 	if (!secondId) return firstId;
@@ -99,7 +149,7 @@ export function rawTokensSinceCoverage(entries: Entry[], customType: V3MemoryCus
 }
 
 export function rawTokensSinceObservationCoverage(entries: Entry[]): number {
-	return rawTokensSinceCoverage(entries, OM_OBSERVATIONS_RECORDED);
+	return rawTokensAfterIndex(entries, latestObservationCoverageIndex(entries));
 }
 
 export function rawTokensSinceReflectionCoverage(entries: Entry[]): number {
@@ -115,7 +165,7 @@ export function rawTokensSinceReflectionCoverage(entries: Entry[]): number {
  */
 export function observedTokensSinceReflectionCoverage(entries: Entry[]): number {
 	const reflectionIndex = latestCoverageIndex(entries, OM_REFLECTIONS_RECORDED);
-	const observationIndex = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+	const observationIndex = latestObservationCoverageIndex(entries);
 	if (observationIndex <= reflectionIndex) return 0;
 
 	let total = 0;
@@ -219,7 +269,11 @@ export function realTokensSinceAnchor(
 	customType: V3MemoryCustomType | undefined,
 	currentContextTokens: number,
 ): number | undefined {
-	const coverageIdx = customType ? latestCoverageIndex(entries, customType) : -1;
+	const coverageIdx = customType === OM_OBSERVATIONS_RECORDED
+		? latestObservationCoverageIndex(entries)
+		: customType
+			? latestCoverageIndex(entries, customType)
+		: -1;
 	const compactionIdx = findLastCompactionIndex(entries);
 	if (compactionIdx > coverageIdx) {
 		const baseline = realContextTokensAfterCompaction(entries, compactionIdx);
@@ -261,7 +315,7 @@ export function rawTokensSinceLastCompaction(entries: Entry[]): number {
  */
 export function observedTokensSinceLastCompaction(entries: Entry[]): number {
 	const start = compactionRangeStartIndex(entries);
-	const coverageIndex = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+	const coverageIndex = latestObservationCoverageIndex(entries);
 	if (coverageIndex < start) return 0;
 
 	let total = 0;
@@ -287,7 +341,7 @@ export type UnobservedSourceSpan = {
  * representation. Returns undefined when coverage reaches the cut.
  */
 export function unobservedSourceSpanBefore(entries: Entry[], cutIndex: number): UnobservedSourceSpan | undefined {
-	const coverageIndex = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+	const coverageIndex = latestObservationCoverageIndex(entries);
 	const start = Math.max(coverageIndex + 1, compactionRangeStartIndex(entries));
 	let firstIndex = -1;
 	let lastIndex = -1;

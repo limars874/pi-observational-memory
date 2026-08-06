@@ -6,6 +6,8 @@ import {
 	observation,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
+	observerCompletedEntry,
+	observerFailedEntry,
 	oldV2ObservationEntry,
 	reflection,
 	reflectionsRecordedEntry,
@@ -83,9 +85,11 @@ describe("session-ledger V3 folding", () => {
 		expect(folded.activeObservations).toEqual([]);
 	});
 
-	it("ignores old V2 entries and unknown custom entries", () => {
+	it("keeps observer outcome metadata outside folded memory", () => {
 		const entries = [
 			textCustomMessage("raw-1", "aaaa"),
+			observerCompletedEntry("om-empty", "raw-1"),
+			observerFailedEntry("om-failed", { coversUpToId: "raw-1" }),
 			oldV2ObservationEntry("v2-obs"),
 			{ type: "custom", id: "unknown", parentId: null, timestamp: "2026-05-02T10:00:00.000Z", customType: "other.memory", data: { any: true } },
 		];

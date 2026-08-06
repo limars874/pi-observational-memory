@@ -1,16 +1,23 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
-import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
+import { ObserverStreamError, runObserver, type ObserverOutcome } from "../agents/observer/agent.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { resolveObserverChunkMaxTokens, resolveWorkerMemoryMaxTokens } from "../config.js";
 import type { ConsolidationPhase, ResolveCtx, ResolveResult, Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
 import {
+	OBSERVER_FAILURE_BACKOFF_BASE_MS,
+	OBSERVER_FAILURE_BACKOFF_MAX_MS,
+	OBSERVER_FAILURE_DETAIL_MAX_CHARS,
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_OBSERVER_COMPLETED,
+	OM_OBSERVER_FAILED,
 	OM_REFLECTIONS_RECORDED,
+	buildObserverCompletedData,
+	buildObserverFailedData,
 	buildObservationsDroppedData,
 	buildObservationsRecordedData,
 	boundWorkerMemory,
@@ -21,12 +28,17 @@ import {
 	isSourceEntry,
 	latestCoverageIndex,
 	latestCoverageMarkerId,
+	latestObservationCoverageIndex,
+	latestObservationCoverageMarkerId,
+	latestObserverFailureForCoverage,
 	observationToSummaryLine,
 	realTokensSinceAnchor,
 	rawTokensSinceObservationCoverage,
 	observedTokensSinceReflectionCoverage,
 	reflectionToSummaryLine,
 	type Entry,
+	type ObserverFailedEntryData,
+	type ObserverFailureReason,
 	type Observation,
 	type Reflection,
 	type V3MemoryCustomType,
@@ -62,6 +74,15 @@ function sourceEntriesAfter(entries: Entry[], index: number): Entry[] {
 
 function appendEntry(pi: ExtensionAPI, customType: string, data: unknown): void {
 	pi.appendEntry(customType, data);
+}
+
+function normalizeObserverOutcome(outcome: ObserverOutcome | Observation[] | undefined): ObserverOutcome {
+	if (Array.isArray(outcome)) {
+		return outcome.length > 0
+			? { kind: "recorded", observations: outcome, attempts: 1 }
+			: { kind: "empty", attempts: 1 };
+	}
+	return outcome ?? { kind: "empty", attempts: 1 };
 }
 
 function mergeReflections(existing: Reflection[], additional: Reflection[]): Reflection[] {
@@ -119,9 +140,20 @@ function stageTokens(entries: Entry[], customType: V3MemoryCustomType, currentTo
 	return real !== undefined ? Math.max(raw, real) : raw;
 }
 
+function observerFailureBackoffActive(
+	failure: ObserverFailedEntryData | undefined,
+	now = Date.now(),
+): failure is ObserverFailedEntryData {
+	return failure !== undefined && now >= failure.failedAt && now < failure.retryAt;
+}
+
 function anyStageDue(entries: Entry[], runtime: Runtime, currentTokens: number | undefined): boolean {
-	return stageDue(entries, runtime, currentTokens, OM_OBSERVATIONS_RECORDED, rawTokensSinceObservationCoverage, runtime.config.observeAfterTokens)
-		|| stageDue(entries, runtime, currentTokens, OM_REFLECTIONS_RECORDED, observedTokensSinceReflectionCoverage, runtime.config.reflectAfterTokens);
+	if (stageDue(entries, runtime, currentTokens, OM_OBSERVATIONS_RECORDED, rawTokensSinceObservationCoverage, runtime.config.observeAfterTokens)) {
+		const coverageId = latestObservationCoverageMarkerId(entries);
+		const failure = latestObserverFailureForCoverage(entries, coverageId);
+		return !observerFailureBackoffActive(failure);
+	}
+	return stageDue(entries, runtime, currentTokens, OM_REFLECTIONS_RECORDED, observedTokensSinceReflectionCoverage, runtime.config.reflectAfterTokens);
 }
 
 function shouldNotifyWorker(runtime: Runtime, ctx: ConsolidationCtx): boolean {
@@ -343,6 +375,64 @@ function debugSessionMetadata(ctx: ConsolidationCtx): { sessionId?: string; sess
 	}
 }
 
+export function observerFailureDelayMs(consecutiveFailures: number): number {
+	const exponent = Math.max(0, Math.min(10, consecutiveFailures - 1));
+	return Math.min(OBSERVER_FAILURE_BACKOFF_MAX_MS, OBSERVER_FAILURE_BACKOFF_BASE_MS * 2 ** exponent);
+}
+
+function observerFailureSummary(reason: ObserverFailureReason, detail: string | undefined): string {
+	if (reason === "no_structured_outcome") return "observer produced no structured outcome after one corrective retry";
+	if (reason === "rejected_observations") return detail ?? "observer proposals were rejected";
+	if (reason === "stream_error") return detail ?? "observer stream failed";
+	return detail ?? "observer execution failed";
+}
+
+function recordObserverFailure(
+	pi: ExtensionAPI,
+	runtime: Runtime,
+	ctx: ConsolidationCtx,
+	entries: Entry[],
+	args: {
+		reason: ObserverFailureReason;
+		coversUpToId: string;
+		coverageId: string | undefined;
+		detail?: string;
+	},
+): void {
+	const previous = latestObserverFailureForCoverage(entries, args.coverageId);
+	const consecutiveFailures = (previous?.consecutiveFailures ?? 0) + 1;
+	const failedAt = Date.now();
+	const delayMs = observerFailureDelayMs(consecutiveFailures);
+	const detail = args.detail?.trim().slice(0, OBSERVER_FAILURE_DETAIL_MAX_CHARS) || undefined;
+	const data = buildObserverFailedData({
+		reason: args.reason,
+		coversUpToId: args.coversUpToId,
+		...(args.coverageId ? { coverageId: args.coverageId } : {}),
+		failedAt,
+		retryAt: failedAt + delayMs,
+		consecutiveFailures,
+		...(detail ? { detail } : {}),
+	});
+	if (!data) throw new Error("could not build observer failure state");
+
+	appendEntry(pi, OM_OBSERVER_FAILED, data);
+	debugLog("observer.failed", {
+		reason: data.reason,
+		coversUpToId: data.coversUpToId,
+		coverageId: data.coverageId,
+		consecutiveFailures,
+		retryAt: data.retryAt,
+		detail,
+	});
+	const summary = observerFailureSummary(args.reason, detail);
+	const retrySeconds = Math.ceil(delayMs / 1_000);
+	runtime.recordConsolidationStageError(
+		ctx,
+		"observer",
+		new Error(`${summary}; coverage unchanged; retrying after ${retrySeconds} seconds`),
+	);
+}
+
 /** Launch a consolidation run when any stage is due. Returns its promise, or undefined when nothing launched. */
 function maybeLaunchConsolidation(pi: ExtensionAPI, runtime: Runtime, ctx: ConsolidationCtx): Promise<void> | undefined {
 	runtime.ensureConfig(ctx.cwd);
@@ -431,26 +521,15 @@ async function runObserverStage(
 	const tokens = stageTokens(entries, OM_OBSERVATIONS_RECORDED, realContextTokens(ctx), rawTokensSinceObservationCoverage);
 	if (tokens < runtime.config.observeAfterTokens) return "continue";
 
-	const sessionMetadata = debugSessionMetadata(ctx);
-	const sessionIdentity = sessionMetadata.sessionId ?? sessionMetadata.sessionFile;
-	const coverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
-
-	// Deliberate-empty backoff (#23): an intentional "nothing to record" verdict
-	// must not re-fire the observer every turn over the same span. Retry only
-	// after another observeAfterTokens worth of new source tokens arrives, and
-	// drop the backoff as soon as coverage advances.
-	const backoff = runtime.observerEmptyBackoff;
-	if (backoff) {
-		if (
-			sessionIdentity !== backoff.sessionIdentity
-			|| coverageId !== backoff.coverageId
-			|| tokens >= backoff.tokensAtEmpty + runtime.config.observeAfterTokens
-		) {
-			runtime.observerEmptyBackoff = undefined;
-		} else {
-			debugLog("observer.empty_backoff", { tokens, resumeAtTokens: backoff.tokensAtEmpty + runtime.config.observeAfterTokens });
-			return "continue";
-		}
+	const coverageId = latestObservationCoverageMarkerId(entries);
+	const failure = latestObserverFailureForCoverage(entries, coverageId);
+	if (observerFailureBackoffActive(failure)) {
+		debugLog("observer.failure_backoff", {
+			reason: failure.reason,
+			consecutiveFailures: failure.consecutiveFailures,
+			retryAt: failure.retryAt,
+		});
+		return "abort";
 	}
 
 	// Resolve the model before building the chunk: the default chunk cap
@@ -462,7 +541,7 @@ async function runObserverStage(
 		return "abort";
 	}
 
-	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+	const lastCoverageIdx = latestObservationCoverageIndex(entries);
 	const backlogEntries = sourceEntriesAfter(entries, lastCoverageIdx);
 
 	// Budget the text that is actually sent to the observer, including source
@@ -513,9 +592,9 @@ async function runObserverStage(
 		omittedObservations: memory.omittedObservations,
 	});
 
-	let observations: Observation[] | undefined;
+	let outcome: ObserverOutcome;
 	try {
-		observations = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
+		const rawOutcome = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
 			model: worker.model as any,
 			apiKey: worker.apiKey,
 			headers: worker.headers,
@@ -530,42 +609,61 @@ async function runObserverStage(
 			thinkingLevel: workerThinkingLevel(runtime, worker),
 			modelRegistry: ctx.modelRegistry,
 		}), consolidationSignal(runtime));
+		outcome = normalizeObserverOutcome(rawOutcome);
 	} catch (error) {
 		if (wasAborted(runtime)) {
 			debugLog("observer.aborted", { coversUpToId });
 			return "abort";
 		}
-		if (error instanceof ObserverStreamError) {
-			// API/stream failure is not a clean empty (#32): surface it as a real
-			// failure instead of the "no observations" path. Coverage stays put.
-			runtime.recordConsolidationStageError(ctx, "observer", error);
-			return "abort";
-		}
-		throw error;
+		const detail = error instanceof Error ? error.message : String(error);
+		recordObserverFailure(pi, runtime, ctx, entries, {
+			reason: error instanceof ObserverStreamError ? "stream_error" : "execution_error",
+			coversUpToId,
+			coverageId,
+			detail,
+		});
+		return "abort";
 	}
 	if (wasAborted(runtime)) {
 		debugLog("observer.aborted", { coversUpToId });
 		return "abort";
 	}
-	if (!observations || observations.length === 0) {
-		// Deliberate empty: routine info, not a warning, and back off re-fires
-		// over the same span (#23).
-		debugLog("observer.empty", { coversUpToId });
-		runtime.observerEmptyBackoff = { sessionIdentity, coverageId, tokensAtEmpty: tokens };
+
+	if (outcome.kind === "failed") {
+		const detail = outcome.reason === "rejected_observations"
+			? `observer rejected ${outcome.rejected} proposed observation${outcome.rejected === 1 ? "" : "s"} with invalid sourceEntryIds`
+			: undefined;
+		recordObserverFailure(pi, runtime, ctx, entries, {
+			reason: outcome.reason,
+			coversUpToId,
+			coverageId,
+			detail,
+		});
+		return "abort";
+	}
+
+	if (outcome.kind === "empty") {
+		const data = buildObserverCompletedData(coversUpToId);
+		if (!data) return "continue";
+		runtime.observerEmptyBackoff = undefined;
+		appendEntry(pi, OM_OBSERVER_COMPLETED, data);
+		debugLog("observer.empty", { coversUpToId, attempts: outcome.attempts, coverageAdvanced: true });
 		if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
-			"Observational memory: observer found nothing new in this chunk (coverage unchanged; will retry later)",
+			"Observational memory: observer confirmed nothing new in this chunk (coverage advanced)",
 			"info",
 		);
 		return "continue";
 	}
-	runtime.observerEmptyBackoff = undefined;
 
+	const observations = outcome.observations;
+	runtime.observerEmptyBackoff = undefined;
 	const data = buildObservationsRecordedData(observations, coversUpToId);
 	if (!data) return "continue";
 	debugLog("observer.records", {
 		count: observations.length,
 		observationTokens: observations.reduce((sum, observation) => sum + observation.tokenCount, 0),
 		coversUpToId,
+		attempts: outcome.attempts,
 	});
 	appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
 	debugLog("observer.appended", { count: observations.length, coversUpToId });

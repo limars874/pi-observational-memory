@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
 
 import {
+	OBSERVER_FAILURE_BACKOFF_MAX_MS,
+	OBSERVER_FAILURE_DETAIL_MAX_CHARS,
 	OM_FOLDED,
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_OBSERVER_COMPLETED,
+	OM_OBSERVER_FAILED,
 	OM_REFLECTIONS_RECORDED,
 	buildObservationsDroppedData,
 	buildObservationsRecordedData,
+	buildObserverCompletedData,
+	buildObserverFailedData,
 	buildReflectionsRecordedData,
 	isMemoryDetails,
 	isObservationsDroppedData,
@@ -14,6 +20,10 @@ import {
 	isObservationsRecordedData,
 	isObservationsRecordedEntry,
 	isObservation,
+	isObserverCompletedData,
+	isObserverCompletedEntry,
+	isObserverFailedData,
+	isObserverFailedEntry,
 	isReflection,
 	isReflectionsRecordedData,
 	isReflectionsRecordedEntry,
@@ -23,6 +33,8 @@ import {
 	observation,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
+	observerCompletedEntry,
+	observerFailedEntry,
 	oldV2CompactionDetails,
 	oldV2ObservationEntry,
 	reflection,
@@ -32,6 +44,8 @@ import {
 describe("session-ledger V3 type guards and builders", () => {
 	it("exports the V3 custom type constants", () => {
 		expect(OM_OBSERVATIONS_RECORDED).toBe("om.observations.recorded");
+		expect(OM_OBSERVER_COMPLETED).toBe("om.observer.completed");
+		expect(OM_OBSERVER_FAILED).toBe("om.observer.failed");
 		expect(OM_REFLECTIONS_RECORDED).toBe("om.reflections.recorded");
 		expect(OM_OBSERVATIONS_DROPPED).toBe("om.observations.dropped");
 		expect(OM_FOLDED).toBe("om.folded");
@@ -42,6 +56,32 @@ describe("session-ledger V3 type guards and builders", () => {
 		expect(isObservation({ ...observation("bbbbbbbbbbbb"), sourceEntryIds: [] })).toBe(false);
 		expect(isObservation({ ...observation("cccccccccccc"), sourceEntryIds: undefined })).toBe(false);
 		expect(isObservation({ ...observation("dddddddddddd"), tokenCount: undefined })).toBe(false);
+	});
+
+	it("accepts explicit empty completion and bounded observer failure data", () => {
+		const completed = { outcome: "empty", coversUpToId: "raw-1" };
+		const failed = {
+			reason: "no_structured_outcome" as const,
+			coversUpToId: "raw-1",
+			failedAt: 1_000,
+			retryAt: 31_000,
+			consecutiveFailures: 1,
+		};
+
+		expect(isObserverCompletedData(completed)).toBe(true);
+		expect(isObserverCompletedData({ ...completed, outcome: "failed" })).toBe(false);
+		expect(isObserverFailedData(failed)).toBe(true);
+		expect(isObserverFailedData({
+			...failed,
+			retryAt: failed.failedAt + OBSERVER_FAILURE_BACKOFF_MAX_MS + 1,
+		})).toBe(false);
+		expect(isObserverFailedData({
+			...failed,
+			detail: "x".repeat(OBSERVER_FAILURE_DETAIL_MAX_CHARS + 1),
+		})).toBe(false);
+		expect(buildObserverCompletedData("raw-1")).toEqual(completed);
+		expect(buildObserverCompletedData("")).toBeUndefined();
+		expect(buildObserverFailedData(failed)).toEqual(failed);
 	});
 
 	it("accepts valid V3 reflection records", () => {
@@ -90,6 +130,8 @@ describe("session-ledger V3 type guards and builders", () => {
 			observations: [observation("aaaaaaaaaaaa")],
 			coversUpToId: "raw-1",
 		}))).toBe(true);
+		expect(isObserverCompletedEntry(observerCompletedEntry("om-empty", "raw-1"))).toBe(true);
+		expect(isObserverFailedEntry(observerFailedEntry("om-failed", { coversUpToId: "raw-1" }))).toBe(true);
 		expect(isReflectionsRecordedEntry(reflectionsRecordedEntry("om-eeeeeeeeeeee", {
 			reflections: [reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"])],
 			coversUpToId: "raw-1",

@@ -8,7 +8,7 @@ import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStr
 import { AGENT_LOOP_MAX_TOKENS, boundedMaxTokens } from "../../model-budget.js";
 import { OBSERVER_SYSTEM } from "./prompts.js";
 import { nowTimestamp, truncateRecordContent } from "../../serialize.js";
-import type { Observation, Relevance } from "../../session-ledger/index.js";
+import type { Observation, ObserverFailureReason, Relevance } from "../../session-ledger/index.js";
 import { observationLineTokenCount } from "../../tokens.js";
 
 interface RunObserverArgs {
@@ -61,11 +61,22 @@ const RecordObservationsSchema = Type.Object({
 				},
 			),
 		}),
-		{ description: "Batch of new observations. May be empty only if the tool is not called at all." },
+		{ description: "Batch of new observations. Use an empty array to explicitly confirm that the chunk warrants no new observations." },
 	),
 });
 
 type RecordObservationsArgs = Static<typeof RecordObservationsSchema>;
+
+type ObserverAttemptState = {
+	toolCalls: number;
+	explicitEmpty: boolean;
+	rejected: number;
+};
+
+export type ObserverOutcome =
+	| { kind: "recorded"; observations: Observation[]; attempts: number }
+	| { kind: "empty"; attempts: number }
+	| { kind: "failed"; reason: ObserverFailureReason; attempts: number; rejected: number };
 
 /**
  * Thrown when the agent loop ends with an API/stream failure (`stopReason`
@@ -103,22 +114,38 @@ export function normalizeSourceEntryIds(
 	return Array.from(seen).sort((a, b) => (allowedOrder.get(a) ?? 0) - (allowedOrder.get(b) ?? 0));
 }
 
-export async function runObserver(args: RunObserverArgs): Promise<Observation[] | undefined> {
-	const { model, apiKey, headers, env, priorReflections, priorObservations, chunk, allowedSourceEntryIds, signal } = args;
+export async function runObserver(args: RunObserverArgs): Promise<ObserverOutcome> {
+	const {
+		model,
+		apiKey,
+		headers,
+		env,
+		priorReflections,
+		priorObservations,
+		chunk,
+		allowedSourceEntryIds,
+		signal,
+		modelRegistry,
+		streamSimple,
+	} = args;
 	const conversation = chunk.trim();
-	if (!conversation) return undefined;
+	if (!conversation) return { kind: "failed", reason: "no_structured_outcome", attempts: 0, rejected: 0 };
 
 	const accumulated = new Map<string, Observation>();
+	let activeAttempt: ObserverAttemptState | undefined;
 
 	const recordObservations: AgentTool<typeof RecordObservationsSchema> = {
 		name: "record_observations",
 		label: "Record observations",
 		description:
 			"Record a batch of new observations distilled from the conversation chunk. " +
-			"Call this multiple times as you work through the chunk. Stop calling when coverage is complete, " +
-			"then emit a short plain-text confirmation to end the run.",
+			"Call this multiple times as needed. If the chunk warrants no new observations, " +
+			"call once with an empty observations array; plain text alone is not a valid outcome.",
 		parameters: RecordObservationsSchema,
 		execute: async (_id, params: RecordObservationsArgs) => {
+			if (!activeAttempt) throw new Error("record_observations called outside an observer attempt");
+			activeAttempt.toolCalls++;
+			if (params.observations.length === 0) activeAttempt.explicitEmpty = true;
 			let added = 0;
 			let duplicates = 0;
 			let rejected = 0;
@@ -149,15 +176,16 @@ export async function runObserver(args: RunObserverArgs): Promise<Observation[] 
 				});
 				added++;
 			}
+			activeAttempt.rejected += rejected;
 			const rejectedPart = rejected > 0
 				? ` ${rejected} observation${rejected === 1 ? "" : "s"} rejected for missing or invalid sourceEntryIds.`
 				: "";
-			const ack =
-				`Recorded ${added} new observation${added === 1 ? "" : "s"} ` +
-				(duplicates > 0 ? `(${duplicates} duplicate${duplicates === 1 ? "" : "s"} skipped).` : ".") +
-				rejectedPart +
-				` Total so far this run: ${accumulated.size}. ` +
-				`Continue if the chunk still has uncovered content; otherwise stop calling the tool and emit a short plain-text confirmation.`;
+			const ack = params.observations.length === 0
+				? "Explicit empty outcome recorded. End the run now."
+				: `Recorded ${added} new observation${added === 1 ? "" : "s"} ` +
+					(duplicates > 0 ? `(${duplicates} duplicate${duplicates === 1 ? "" : "s"} skipped).` : ".") +
+					rejectedPart +
+					` Total so far this run: ${accumulated.size}. Continue if the chunk still has uncovered content; otherwise end the run.`;
 			return { content: [{ type: "text", text: ack }], details: { added, duplicates, rejected, total: accumulated.size } };
 		},
 	};
@@ -173,7 +201,7 @@ ${joinOrEmpty(priorObservations)}
 
 Current local time: ${now}
 
-Compress the following new conversation chunk into observations by calling record_observations one or more times. Do not restate facts already present in current reflections or current observations. Prefer inline conversation timestamps when assigning times; fall back to the current local time above only if no message timestamp applies. Stop calling the tool and reply with a short plain-text confirmation once the chunk is fully covered.
+Compress the following new conversation chunk into observations by calling record_observations one or more times. Do not restate facts already present in current reflections or current observations. Prefer inline conversation timestamps when assigning times; fall back to the current local time above only if no message timestamp applies. If there is nothing new to record, call record_observations with {"observations": []}. A plain-text response without that tool call is a failed outcome.
 
 NEW CONVERSATION CHUNK:
 ${conversation}`;
@@ -186,59 +214,94 @@ ${conversation}`;
 		},
 	];
 
-	const context: AgentContext = {
-		messages: [{ role: "system", content: OBSERVER_SYSTEM, timestamp: Date.now() }],
-		tools: [recordObservations as AgentTool<any>],
-	};
-
 	const reasoning = (model as { reasoning?: unknown }).reasoning;
 	const thinkingLevel = args.thinkingLevel ?? "low";
 	const effectiveMaxTurns = args.maxTurns && args.maxTurns > 0 ? args.maxTurns : undefined;
-	let turnCount = 0;
-	const config: AgentLoopConfig = {
-		model,
-		apiKey,
-		headers,
-		env,
-		maxTokens: boundedMaxTokens(model, args.maxOutputTokens ?? AGENT_LOOP_MAX_TOKENS),
-		convertToLlm: (msgs) => msgs as Message[],
-		toolExecution: "sequential",
-		...(reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
-		...(effectiveMaxTurns !== undefined
-			? {
-				finishTurn: (turn) => {
-					if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
-					turnCount++;
-					return turnCount >= effectiveMaxTurns ? { action: "end" } : undefined;
-				},
+	const loop = args.agentLoop ?? agentLoop;
+
+	const runAttempt = async (attemptPrompts: Message[]): Promise<{
+		state: ObserverAttemptState;
+		streamError?: { stopReason: string; errorMessage?: string };
+	}> => {
+		const state: ObserverAttemptState = { toolCalls: 0, explicitEmpty: false, rejected: 0 };
+		activeAttempt = state;
+		let turnCount = 0;
+		const config: AgentLoopConfig = {
+			model,
+			apiKey,
+			headers,
+			env,
+			maxTokens: boundedMaxTokens(model, args.maxOutputTokens ?? AGENT_LOOP_MAX_TOKENS),
+			convertToLlm: (msgs) => msgs as Message[],
+			toolExecution: "sequential",
+			...(reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
+			...(effectiveMaxTurns !== undefined
+				? {
+					finishTurn: (turn) => {
+						if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
+						turnCount++;
+						return turnCount >= effectiveMaxTurns ? { action: "end" } : undefined;
+					},
+				}
+				: {}),
+		};
+		const context: AgentContext = {
+			messages: [{ role: "system", content: OBSERVER_SYSTEM, timestamp: Date.now() }],
+			tools: [recordObservations as AgentTool<any>],
+		};
+		let streamError: { stopReason: string; errorMessage?: string } | undefined;
+		try {
+			const stream = loop(
+				attemptPrompts,
+				context,
+				config,
+				signal,
+				resolveWorkerStreamSimple(model, modelRegistry, streamSimple),
+			);
+			for await (const event of stream) {
+				logAgentStreamError("observer", event);
+				const message = (event as { message?: { role?: string; stopReason?: string; errorMessage?: string } }).message;
+				if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+					streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+				}
+
 			}
-			: {}),
+			await stream.result();
+			return { state, streamError };
+		} finally {
+			activeAttempt = undefined;
+		}
 	};
 
-	const loop = args.agentLoop ?? agentLoop;
-	const stream = loop(
-		prompts,
-		context,
-		config,
-		signal,
-		resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple),
-	);
-	let streamError: { stopReason: string; errorMessage?: string } | undefined;
-	for await (const event of stream) {
-		// Drain events; the tool's execute already collects records.
-		logAgentStreamError("observer", event);
-		// Watch for a terminal API/stream failure so it is not conflated with
-		// a deliberate empty result.
-		const message = (event as { message?: { role?: string; stopReason?: string; errorMessage?: string } }).message;
-		if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
-			streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
-		}
-	}
-	await stream.result();
+	const classifyAttempt = (
+		state: ObserverAttemptState,
+		streamError: { stopReason: string; errorMessage?: string } | undefined,
+		attempts: number,
+	): ObserverOutcome => {
+		if (accumulated.size > 0) {
+			return { kind: "recorded", observations: Array.from(accumulated.values()), attempts };
 
-	if (accumulated.size === 0) {
+		}
 		if (streamError) throw new ObserverStreamError(streamError.stopReason, streamError.errorMessage);
-		return undefined;
-	}
-	return Array.from(accumulated.values());
+		if (state.rejected > 0) {
+			return { kind: "failed", reason: "rejected_observations", attempts, rejected: state.rejected };
+		}
+		if (state.toolCalls > 0 && state.explicitEmpty) return { kind: "empty", attempts };
+		return { kind: "failed", reason: "no_structured_outcome", attempts, rejected: 0 };
+	};
+
+	const firstAttempt = await runAttempt(prompts);
+	const firstOutcome = classifyAttempt(firstAttempt.state, firstAttempt.streamError, 1);
+	if (firstOutcome.kind !== "failed" || firstOutcome.reason !== "no_structured_outcome") return firstOutcome;
+
+	const correction: Message = {
+		role: "user",
+		content: [{
+			type: "text",
+			text: `CORRECTIVE RETRY: Your previous response did not produce the required structured outcome. Call record_observations now. Use {"observations": []} if the chunk warrants no new observations; do not answer with plain text only.\n\n${userText}`,
+		}],
+		timestamp: Date.now(),
+	};
+	const secondAttempt = await runAttempt([correction]);
+	return classifyAttempt(secondAttempt.state, secondAttempt.streamError, 2);
 }

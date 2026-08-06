@@ -8,7 +8,7 @@ vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
 }));
 
 import { registerCompactionHook } from "../src/hooks/compaction-hook.js";
-import { OM_OBSERVATIONS_RECORDED } from "../src/session-ledger/index.js";
+import { OM_OBSERVATIONS_RECORDED, OM_OBSERVER_COMPLETED } from "../src/session-ledger/index.js";
 import { compactionEntry, observation, observationsRecordedEntry, rawMessage, type TestEntry } from "./fixtures/session.js";
 
 function userMessage(id: string, text = `user ${id}`): TestEntry {
@@ -149,7 +149,8 @@ describe("compaction hook synchronous catch-up", () => {
 
 		const result = await run("u2") as any;
 
-		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_COMPLETED, { outcome: "empty", coversUpToId: "a2" });
+		expect(pi.appendEntry).not.toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.anything());
 		expect(result.compaction.firstKeptEntryId).toBe("a1");
 	});
 

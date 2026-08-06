@@ -7,11 +7,13 @@ import type { Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
 import {
 	OM_OBSERVATIONS_RECORDED,
+	OM_OBSERVER_COMPLETED,
 	boundWorkerMemory,
+	buildObserverCompletedData,
 	buildObservationsRecordedData,
 	fullProjection,
 	isSourceEntry,
-	latestCoverageIndex,
+	latestObservationCoverageIndex,
 	observationToSummaryLine,
 	reflectionToSummaryLine,
 	type Entry,
@@ -68,7 +70,7 @@ export async function catchUpObserver(args: CatchUpArgs): Promise<CatchUpResult>
 	// it, so starting later would mark unread source between the frontier and
 	// the range start as observed and the background observer would never
 	// revisit it.
-	const frontierIndex = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+	const frontierIndex = latestObservationCoverageIndex(entries);
 	let remaining = entries.slice(frontierIndex + 1, gap.lastIndex + 1).filter(isSourceEntry);
 	let branch = entries;
 
@@ -91,7 +93,7 @@ export async function catchUpObserver(args: CatchUpArgs): Promise<CatchUpResult>
 
 		let observations;
 		try {
-			observations = await runObserver({
+			const outcome = await runObserver({
 				model: resolved.model as any,
 				apiKey: resolved.apiKey,
 				headers: resolved.headers,
@@ -106,6 +108,11 @@ export async function catchUpObserver(args: CatchUpArgs): Promise<CatchUpResult>
 				thinkingLevel: runtime.config.model?.thinking ?? "low",
 				modelRegistry: ctx.modelRegistry as any,
 			});
+			observations = Array.isArray(outcome)
+				? outcome.length > 0
+					? { kind: "recorded" as const, observations: outcome, attempts: 1 }
+					: { kind: "empty" as const, attempts: 1 }
+				: outcome;
 		} catch (error) {
 			if (signal?.aborted) return { ...result, stoppedBecause: "aborted" };
 			const errorMessage = error instanceof Error ? error.message : String(error);
@@ -114,7 +121,24 @@ export async function catchUpObserver(args: CatchUpArgs): Promise<CatchUpResult>
 			return { ...result, stoppedBecause: "error" };
 		}
 
-		const data = observations && observations.length > 0 ? buildObservationsRecordedData(observations, coversUpToId) : undefined;
+		if (observations.kind === "failed") {
+			debugLog("compaction.catch_up.empty", {
+				chunkIndex,
+				coversUpToId,
+				reason: observations.reason,
+			});
+			if (ctx.hasUI) ctx.ui.notify("Observational memory: catch-up observer produced no valid structured outcome", "warning");
+			return { ...result, stoppedBecause: "error" };
+		}
+
+		if (observations.kind === "empty") {
+			const completed = buildObserverCompletedData(coversUpToId);
+			if (completed) pi.appendEntry(OM_OBSERVER_COMPLETED, completed);
+			debugLog("compaction.catch_up.empty", { chunkIndex, coversUpToId, coverageAdvanced: completed !== undefined });
+			return { ...result, stoppedBecause: "empty" };
+		}
+
+		const data = buildObservationsRecordedData(observations.observations, coversUpToId);
 		if (!data) {
 			debugLog("compaction.catch_up.empty", { chunkIndex, coversUpToId });
 			return { ...result, stoppedBecause: "empty" };
@@ -122,7 +146,7 @@ export async function catchUpObserver(args: CatchUpArgs): Promise<CatchUpResult>
 
 		pi.appendEntry(OM_OBSERVATIONS_RECORDED, data);
 		result.chunksRecorded++;
-		debugLog("compaction.catch_up.recorded", { chunkIndex, count: observations!.length, coversUpToId });
+		debugLog("compaction.catch_up.recorded", { chunkIndex, count: observations.observations.length, coversUpToId });
 
 		// Coverage is positional: everything at or before the marker counts as
 		// covered, including entries the serializer skipped for lack of
