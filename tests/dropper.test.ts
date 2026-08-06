@@ -7,7 +7,7 @@ import {
 	runDropper,
 	selectDropCandidates,
 } from "../src/agents/dropper/agent.js";
-import { observation, reflection } from "./fixtures/session.js";
+import { observation, observationWithLineTokens, reflection } from "./fixtures/session.js";
 
 function fakeAgentLoop(handler: (prompts: any[], context: any, config: any) => Promise<void> | void): any {
 	return ((prompts: any[], context: any, config: any) => ({
@@ -20,15 +20,15 @@ function fakeAgentLoop(handler: (prompts: any[], context: any, config: any) => P
 }
 
 describe("V3 dropper agent", () => {
-	const obsA = observation("aaaaaaaaaaaa", { relevance: "medium" });
-	const obsB = observation("bbbbbbbbbbbb", { relevance: "low" });
-	const critical = observation("cccccccccccc", { relevance: "critical" });
+	const obsA = observationWithLineTokens("aaaaaaaaaaaa", 30, { relevance: "medium" });
+	const obsB = observationWithLineTokens("bbbbbbbbbbbb", 30, { relevance: "low" });
+	const critical = observationWithLineTokens("cccccccccccc", 30, { relevance: "critical" });
 	const baseArgs = {
 		model: {} as any,
 		apiKey: "test",
 		reflections: [reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"])],
 		observations: [obsA, obsB, critical],
-		targetTokens: 20,
+		targetTokens: 60,
 	};
 
 	it("computes observation pool fullness defensively", () => {
@@ -100,7 +100,7 @@ describe("V3 dropper agent", () => {
 		await runDropper({ ...baseArgs, agentLoop: loop });
 
 		expect(userText).toContain("fullness against target: ~150%");
-		expect(userText).toContain("over target by ~10 tokens");
+		expect(userText).toContain("over target by ~30 tokens");
 		expect(userText).toContain("[coverage: partial]");
 		expect(userText).toContain("[coverage: none]");
 		expect(userText).toContain("Maximum drops allowed this run: 1 observation");
@@ -212,8 +212,8 @@ describe("V3 dropper agent", () => {
 
 		await expect(runDropper({
 			...baseArgs,
-			observations: [observation("aaaaaaaaaaaa", { relevance: "low", tokenCount: 10 })],
-			targetTokens: 10,
+			observations: [observationWithLineTokens("aaaaaaaaaaaa", 20, { relevance: "low" })],
+			targetTokens: 20,
 			agentLoop: loop,
 		})).resolves.toBeUndefined();
 		expect(called).toBe(false);

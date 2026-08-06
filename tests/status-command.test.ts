@@ -4,7 +4,7 @@ import { registerStatusCommand } from "../src/commands/status.js";
 import {
 	compactionEntry,
 	memoryDetails,
-	observation,
+	observationWithLineTokens,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
 	oldV2CompactionDetails,
@@ -69,8 +69,8 @@ describe("V3 /om:status", () => {
 	});
 
 	it("reports V3 ledger counts, visible/full drift, and ignores old V2 memory", async () => {
-		const obsA = observation("aaaaaaaaaaaa", { tokenCount: 5 });
-		const obsB = observation("bbbbbbbbbbbb", { tokenCount: 7 });
+		const obsA = observationWithLineTokens("aaaaaaaaaaaa", 20);
+		const obsB = observationWithLineTokens("bbbbbbbbbbbb", 28);
 		const ref = reflection("eeeeeeeeeeee", ["bbbbbbbbbbbb"], { tokenCount: 3 });
 		const entries = [
 			textCustomMessage("raw-1", "aaaa"),
@@ -86,8 +86,8 @@ describe("V3 /om:status", () => {
 
 		expect(output).toContain("Observations: 2 recorded / 1 dropped / 1 active / 1 visible +1 -1");
 		expect(output).toContain("Reflections:  1 recorded / 0 visible +1");
-		expect(output).toContain("Visible observation pool: ~5 / 40 tokens (13%)");
-		expect(output).toContain("Active observation pool: ~7 / 20 target tokens (35%)");
+		expect(output).toContain("Visible observation pool: ~20 / 40 tokens (50%)");
+		expect(output).toContain("Active observation pool: ~28 / 20 target tokens (140%)");
 		expect(output).not.toContain("Visible:");
 		expect(output).not.toContain("Drift:");
 		expect(output).not.toContain("full truth");
@@ -96,7 +96,7 @@ describe("V3 /om:status", () => {
 	});
 
 	it("shows separate progress clocks, visible pool, active observation pool, and reflection pool", async () => {
-		const obs = observation("aaaaaaaaaaaa", { tokenCount: 5 });
+		const obs = observationWithLineTokens("aaaaaaaaaaaa", 20);
 		const ref = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"], { tokenCount: 3 });
 		const entries = [
 			textCustomMessage("raw-1", "aaaaaaaa"),
@@ -114,8 +114,8 @@ describe("V3 /om:status", () => {
 		expect(output).toContain("/ 20 tokens");
 		expect(output).toContain("Next compaction:");
 		expect(output).toContain("/ 30 tokens");
-		expect(output).toContain("Visible observation pool: ~5 / 40 tokens (13%)");
-		expect(output).toContain("Active observation pool: ~5 / 20 target tokens (25%)");
+		expect(output).toContain("Visible observation pool: ~20 / 40 tokens (50%)");
+		expect(output).toContain("Active observation pool: ~20 / 20 target tokens (100%)");
 		expect(output).toContain("Reflection pool:         ~3 tokens");
 		expect(output).not.toContain("Observation pool:");
 		expect(output).not.toContain("Full fold pool:");
@@ -123,7 +123,7 @@ describe("V3 /om:status", () => {
 	});
 
 	it("shows over-target active observation pool in the Activity section", async () => {
-		const obs = observation("aaaaaaaaaaaa", { tokenCount: 25 });
+		const obs = observationWithLineTokens("aaaaaaaaaaaa", 25);
 		const entries = [
 			textCustomMessage("raw-1", "aaaaaaaa"),
 			observationsRecordedEntry("om-obs", { observations: [obs], coversUpToId: "raw-1" }),

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+	contextTokensFromUsage,
 	earlierCoverageMarkerId,
 	entryIndexById,
 	isSourceEntry,
@@ -11,6 +12,7 @@ import {
 	rawTokensSinceLastCompaction,
 	rawTokensSinceObservationCoverage,
 	rawTokensSinceReflectionCoverage,
+	realTokensSinceAnchor,
 } from "../src/session-ledger/index.js";
 import {
 	V3_OBSERVATIONS_DROPPED,
@@ -23,9 +25,21 @@ import {
 	observationsRecordedEntry,
 	oldV2ObservationEntry,
 	reflection,
+	rawMessage,
 	reflectionsRecordedEntry,
 	textCustomMessage,
 } from "./fixtures/session.js";
+
+function assistantUsageEntry(id: string, totalTokens: number, stopReason = "stop") {
+	return rawMessage(id, "assistant", {
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: "assistant" }],
+			stopReason,
+			usage: { totalTokens },
+		},
+	});
+}
 
 describe("session-ledger V3 progress helpers", () => {
 	it("detects only raw/source entries as source entries", () => {
@@ -42,6 +56,56 @@ describe("session-ledger V3 progress helpers", () => {
 		const entries = [textCustomMessage("raw-1", "abcd"), textCustomMessage("raw-2", "efgh")];
 		expect(entryIndexById(entries).get("raw-1")).toBe(0);
 		expect(entryIndexById(entries).get("raw-2")).toBe(1);
+	});
+
+	it("reads provider context usage without inventing partial totals", () => {
+		expect(contextTokensFromUsage({ totalTokens: 120 })).toBe(120);
+		expect(contextTokensFromUsage({ input: 40, output: 20, cacheRead: 30, cacheWrite: 10 })).toBe(100);
+		expect(contextTokensFromUsage({ input: 40, output: 20, cacheRead: 30 })).toBeUndefined();
+		expect(contextTokensFromUsage({ totalTokens: -1 })).toBeUndefined();
+	});
+
+	it("measures real context growth from the usage at the coverage anchor", () => {
+		const entries = [
+			assistantUsageEntry("raw-1", 100),
+			observationsRecordedEntry("om-1", {
+				observations: [observation("aaaaaaaaaaaa")],
+				coversUpToId: "raw-1",
+			}),
+			textCustomMessage("raw-2", "new source"),
+			assistantUsageEntry("raw-3", 160),
+		];
+
+		expect(realTokensSinceAnchor(entries, undefined, 160)).toBe(160);
+		expect(realTokensSinceAnchor(entries, V3_OBSERVATIONS_RECORDED, 160)).toBe(60);
+	});
+
+	it("uses the post-compaction usage baseline when the coverage anchor predates compaction", () => {
+		const entries = [
+			assistantUsageEntry("raw-1", 100),
+			observationsRecordedEntry("om-1", {
+				observations: [observation("aaaaaaaaaaaa")],
+				coversUpToId: "raw-1",
+			}),
+			compactionEntry("cmp-1", { firstKeptEntryId: "raw-2" }),
+			textCustomMessage("raw-2", "kept source"),
+			assistantUsageEntry("raw-3", 40),
+		];
+
+		expect(realTokensSinceAnchor(entries, V3_OBSERVATIONS_RECORDED, 40)).toBe(0);
+	});
+
+	it("ignores failed assistant usage and falls back when no valid baseline exists", () => {
+		const entries = [
+			assistantUsageEntry("raw-1", 500, "error"),
+			observationsRecordedEntry("om-1", {
+				observations: [observation("aaaaaaaaaaaa")],
+				coversUpToId: "raw-1",
+			}),
+			textCustomMessage("raw-2", "source"),
+		];
+
+		expect(realTokensSinceAnchor(entries, V3_OBSERVATIONS_RECORDED, 600)).toBeUndefined();
 	});
 
 	it("counts raw tokens after a branch index and ignores memory/compaction entries", () => {

@@ -139,6 +139,27 @@ export function observation(
 	};
 }
 
+export function observationWithLineTokens(
+	id: string,
+	lineTokens: number,
+	overrides: Partial<TestObservation> = {},
+): TestObservation {
+	const timestamp = overrides.timestamp ?? DEFAULT_TIMESTAMP;
+	const relevance = overrides.relevance ?? "medium";
+	const prefix = `[${id}] ${timestamp} [${relevance}] `;
+	const contentLength = lineTokens * 4 - prefix.length;
+	if (contentLength < 0) {
+		throw new Error(`lineTokens must be at least ${Math.ceil(prefix.length / 4)}`);
+	}
+	return observation(id, {
+		...overrides,
+		timestamp,
+		relevance,
+		content: "x".repeat(contentLength),
+		tokenCount: lineTokens,
+	});
+}
+
 export function reflection(
 	id: string,
 	supportingObservationIds: string[] = ["obs-1"],

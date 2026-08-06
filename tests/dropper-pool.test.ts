@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import { observationPoolMetrics } from "../src/agents/dropper/pool.js";
 import { foldLedger } from "../src/session-ledger/index.js";
-import { observation, observationsDroppedEntry, observationsRecordedEntry, textCustomMessage } from "./fixtures/session.js";
+import { observationWithLineTokens, observationsDroppedEntry, observationsRecordedEntry, textCustomMessage } from "./fixtures/session.js";
 
 describe("V3 dropper active observation pool metrics", () => {
 	it("reports below-target pools as not ready", () => {
-		const observations = [observation("aaaaaaaaaaaa", { relevance: "low", tokenCount: 20 })];
+		const observations = [observationWithLineTokens("aaaaaaaaaaaa", 20, { relevance: "low" })];
 
 		expect(observationPoolMetrics(observations, 100)).toMatchObject({
 			observationTokens: 20,
@@ -22,8 +22,8 @@ describe("V3 dropper active observation pool metrics", () => {
 
 	it("reports at-target pools as not ready", () => {
 		const observations = [
-			observation("aaaaaaaaaaaa", { relevance: "low", tokenCount: 50 }),
-			observation("bbbbbbbbbbbb", { relevance: "medium", tokenCount: 50 }),
+			observationWithLineTokens("aaaaaaaaaaaa", 50, { relevance: "low" }),
+			observationWithLineTokens("bbbbbbbbbbbb", 50, { relevance: "medium" }),
 		];
 
 		const metrics = observationPoolMetrics(observations, 100);
@@ -38,9 +38,9 @@ describe("V3 dropper active observation pool metrics", () => {
 
 	it("reports above-target pools as ready with target-return max drops", () => {
 		const observations = [
-			observation("aaaaaaaaaaaa", { relevance: "low", tokenCount: 50 }),
-			observation("bbbbbbbbbbbb", { relevance: "medium", tokenCount: 50 }),
-			observation("cccccccccccc", { relevance: "critical", tokenCount: 50 }),
+			observationWithLineTokens("aaaaaaaaaaaa", 50, { relevance: "low" }),
+			observationWithLineTokens("bbbbbbbbbbbb", 50, { relevance: "medium" }),
+			observationWithLineTokens("cccccccccccc", 50, { relevance: "critical" }),
 		];
 
 		const metrics = observationPoolMetrics(observations, 100);
@@ -56,20 +56,20 @@ describe("V3 dropper active observation pool metrics", () => {
 
 	it("clamps target-return max drops to active observation count", () => {
 		const observations = [
-			observation("aaaaaaaaaaaa", { relevance: "low", tokenCount: 1 }),
-			observation("bbbbbbbbbbbb", { relevance: "critical", tokenCount: 1 }),
+			observationWithLineTokens("aaaaaaaaaaaa", 20, { relevance: "low" }),
+			observationWithLineTokens("bbbbbbbbbbbb", 20, { relevance: "critical" }),
 		];
 
 		const metrics = observationPoolMetrics(observations, 0);
 
-		expect(metrics.tokensOverTarget).toBe(2);
+		expect(metrics.tokensOverTarget).toBe(40);
 		expect(metrics.maxDropsAllowed).toBe(2);
 		expect(metrics.ready).toBe(true);
 	});
 
 	it("uses folded active observations so tombstones reduce readiness", () => {
-		const dropped = observation("aaaaaaaaaaaa", { relevance: "low", tokenCount: 100 });
-		const active = observation("bbbbbbbbbbbb", { relevance: "low", tokenCount: 20 });
+		const dropped = observationWithLineTokens("aaaaaaaaaaaa", 100, { relevance: "low" });
+		const active = observationWithLineTokens("bbbbbbbbbbbb", 20, { relevance: "low" });
 		const entries = [
 			textCustomMessage("raw-1", "aaaaaaaa"),
 			observationsRecordedEntry("om-obs", { observations: [dropped, active], coversUpToId: "raw-1" }),
