@@ -7,12 +7,16 @@ import {
 	isSourceEntry,
 	latestCoverageIndex,
 	latestCoverageMarkerId,
+	latestObservationCoverageIndex,
+	latestObservationCoverageMarkerId,
+	latestObserverFailureForCoverage,
 	rawTokensAfterIndex,
 	rawTokensSinceDropCoverage,
 	rawTokensSinceLastCompaction,
 	rawTokensSinceObservationCoverage,
 	rawTokensSinceReflectionCoverage,
 	realTokensSinceAnchor,
+	realTokensSinceObservationCoverage,
 } from "../src/session-ledger/index.js";
 import {
 	V3_OBSERVATIONS_DROPPED,
@@ -23,6 +27,8 @@ import {
 	observation,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
+	observerCompletedEntry,
+	observerFailedEntry,
 	oldV2ObservationEntry,
 	reflection,
 	rawMessage,
@@ -136,6 +142,77 @@ describe("session-ledger V3 progress helpers", () => {
 		expect(rawTokensSinceObservationCoverage(entries)).toBe(9); // raw-2 + raw-3 + raw-4
 		expect(rawTokensSinceReflectionCoverage(entries)).toBe(7); // raw-3 + raw-4
 		expect(rawTokensSinceDropCoverage(entries)).toBe(7); // covers ledger entry om-eeeeeeeeeeee, raw after it
+	});
+
+	it("advances observation coverage through explicit empty completion", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-obs", {
+				observations: [observation("aaaaaaaaaaaa")],
+				coversUpToId: "raw-1",
+			}),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+			observerCompletedEntry("om-empty", "raw-2"),
+			textCustomMessage("raw-3", "cccccccccccc"),
+		];
+
+		expect(latestObservationCoverageIndex(entries)).toBe(2);
+		expect(latestObservationCoverageMarkerId(entries)).toBe("raw-2");
+		expect(rawTokensSinceObservationCoverage(entries)).toBe(3);
+	});
+
+	it("uses explicit empty completion as a real-token coverage anchor", () => {
+		const entries = [
+			assistantUsageEntry("raw-1", 100),
+			observerCompletedEntry("om-empty", "raw-1"),
+			assistantUsageEntry("raw-2", 150),
+		];
+
+		expect(realTokensSinceObservationCoverage(entries, 150)).toBe(50);
+	});
+
+	it("ignores malformed, orphaned, and non-source empty completion markers", () => {
+		const recorded = observationsRecordedEntry("om-recorded", {
+			observations: [observation("aaaaaaaaaaaa")],
+			coversUpToId: "raw-1",
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			recorded,
+			observerCompletedEntry("om-before-source", "raw-2"),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+			observerCompletedEntry("om-orphan", "missing"),
+			observerCompletedEntry("om-non-source", "om-recorded"),
+			observerCompletedEntry("om-malformed", "raw-2", { data: { outcome: "recorded", coversUpToId: "raw-2" } }),
+		];
+
+		expect(latestObservationCoverageMarkerId(entries)).toBe("raw-1");
+		expect(rawTokensSinceObservationCoverage(entries)).toBe(2);
+	});
+
+	it("returns only valid failure state for the current coverage", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observerFailedEntry("failed-old", { coversUpToId: "raw-1", coverageId: "older" }),
+			observerFailedEntry("failed-current", { coversUpToId: "raw-1", retryAt: 61_000, consecutiveFailures: 2 }),
+			observerFailedEntry("failed-orphan", { coversUpToId: "missing", retryAt: 91_000, consecutiveFailures: 3 }),
+			textCustomMessage("raw-2", "bbbb"),
+			observerFailedEntry("failed-covered", { coversUpToId: "raw-2", coverageId: "raw-1", retryAt: 121_000, consecutiveFailures: 4 }),
+			observerFailedEntry("failed-same-boundary", { coversUpToId: "raw-2", coverageId: "raw-2", retryAt: 151_000, consecutiveFailures: 5 }),
+			observerFailedEntry("failed-orphan-coverage", { coversUpToId: "raw-2", coverageId: "missing", retryAt: 181_000, consecutiveFailures: 6 }),
+		];
+
+		expect(latestObserverFailureForCoverage(entries, undefined)).toMatchObject({
+			coversUpToId: "raw-1",
+			retryAt: 61_000,
+			consecutiveFailures: 2,
+		});
+		expect(latestObserverFailureForCoverage(entries, "raw-1")).toMatchObject({
+			coversUpToId: "raw-2",
+			retryAt: 121_000,
+			consecutiveFailures: 4,
+		});
+		expect(latestObserverFailureForCoverage(entries, "different")).toBeUndefined();
 	});
 
 	it("lets coversUpToId point to a memory ledger entry", () => {

@@ -2,7 +2,24 @@ import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import * as PiAi from "@earendil-works/pi-ai";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
+
+const { ModelRegistry } = PiCodingAgent;
+
+type PiCodingAgentCompat = {
+	AuthStorage?: { inMemory(initial?: Record<string, unknown>): any };
+	ModelRuntime?: { create(options: Record<string, unknown>): Promise<any> };
+};
+
+type PiAiCompat = {
+	InMemoryCredentialStore?: new () => {
+		modify(provider: string, update: () => Promise<unknown>): Promise<unknown>;
+	};
+};
+
+const codingAgentCompat = PiCodingAgent as unknown as PiCodingAgentCompat;
+const piAiCompat = PiAi as unknown as PiAiCompat;
 
 import { DEFAULTS } from "../src/config.js";
 import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
@@ -89,21 +106,58 @@ async function startMockAnthropic(requests: RecordedRequest[]): Promise<{ server
  * OAuth-shaped: no stored apiKey, an Authorization header instead. This is the
  * `{ ok: true, headers }` (no apiKey) result the real registry hands extensions.
  */
-function oauthModelRegistry(): any {
-	return new ModelRegistry({
-		getAuth: async () => undefined,
-		getCompatibilityRequestConfig: () => ({ headers: { Authorization: OAUTH_TOKEN }, authHeader: false }),
-		isUsingOAuth: (providerId: string) => providerId === "kimi-coding",
-	} as any);
+async function oauthModelRegistry(): Promise<any> {
+	const LegacyAuthStorage = codingAgentCompat.AuthStorage;
+	const LegacyModelRegistry = ModelRegistry as any;
+	if (LegacyAuthStorage && typeof LegacyModelRegistry.inMemory === "function") {
+		const registry = LegacyModelRegistry.inMemory(LegacyAuthStorage.inMemory());
+		registry.registerProvider("kimi-coding", {
+			headers: { Authorization: OAUTH_TOKEN },
+			authHeader: false,
+		});
+		return registry;
+	}
+
+	const ModelRuntime = codingAgentCompat.ModelRuntime;
+	const InMemoryCredentialStore = piAiCompat.InMemoryCredentialStore;
+	if (!ModelRuntime || !InMemoryCredentialStore) throw new Error("Unsupported pi model auth API");
+	const runtime = await ModelRuntime.create({
+		credentials: new InMemoryCredentialStore(),
+		modelsPath: null,
+		allowModelNetwork: false,
+	});
+	runtime.registerProvider("kimi-coding", {
+		headers: { Authorization: OAUTH_TOKEN },
+		authHeader: false,
+	});
+	return new ModelRegistry(runtime);
 }
 
 /** Real ModelRegistry for an OAuth provider whose credentials no longer resolve. */
-function expiredOAuthModelRegistry(provider: string): any {
-	return new ModelRegistry({
-		getAuth: async () => undefined,
-		getCompatibilityRequestConfig: () => ({ headers: undefined, authHeader: true }),
-		isUsingOAuth: (providerId: string) => providerId === provider,
-	} as any);
+async function expiredOAuthModelRegistry(provider: string): Promise<any> {
+	const LegacyAuthStorage = codingAgentCompat.AuthStorage;
+	const LegacyModelRegistry = ModelRegistry as any;
+	if (LegacyAuthStorage && typeof LegacyModelRegistry.inMemory === "function") {
+		const authStorage = LegacyAuthStorage.inMemory({
+			[provider]: { type: "oauth", access: "expired", refresh: "expired", expires: 0 },
+		});
+		vi.spyOn(authStorage, "getApiKey").mockResolvedValue(undefined);
+		return LegacyModelRegistry.inMemory(authStorage);
+	}
+
+	const ModelRuntime = codingAgentCompat.ModelRuntime;
+	const InMemoryCredentialStore = piAiCompat.InMemoryCredentialStore;
+	if (!ModelRuntime || !InMemoryCredentialStore) throw new Error("Unsupported pi model auth API");
+	const credentials = new InMemoryCredentialStore();
+	await credentials.modify(provider, async () => ({
+		type: "oauth",
+		access: "expired",
+		refresh: "expired",
+		expires: Date.now() + 60_000,
+	}));
+	const runtime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+	vi.spyOn(runtime, "getAuth").mockResolvedValue(undefined);
+	return new ModelRegistry(runtime);
 }
 
 let activeServer: Server | undefined;
@@ -155,7 +209,7 @@ describe("OAuth provider end-to-end consolidation", () => {
 			hasUI: true,
 			ui: { notify: (message: string) => notices.push(message) },
 			model,
-			modelRegistry: oauthModelRegistry(),
+			modelRegistry: await oauthModelRegistry(),
 			sessionManager: { getBranch: () => entries },
 		});
 		await runtime.consolidationPromise;
@@ -208,7 +262,7 @@ describe("OAuth provider end-to-end consolidation", () => {
 			hasUI: true,
 			ui: { notify: (message: string) => notices.push(message) },
 			model,
-			modelRegistry: expiredOAuthModelRegistry("openai-codex"),
+			modelRegistry: await expiredOAuthModelRegistry("openai-codex"),
 			sessionManager: { getBranch: () => entries },
 		});
 		await runtime.consolidationPromise;

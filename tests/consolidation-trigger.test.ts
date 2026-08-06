@@ -14,10 +14,17 @@ vi.mock("../src/agents/reflector/agent.js", () => ({ runReflector: mockAgents.ru
 vi.mock("../src/agents/dropper/agent.js", () => ({ runDropper: mockAgents.runDropper }));
 
 import { ObserverStreamError } from "../src/agents/observer/agent.js";
-import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
 import {
+	observerFailureDelayMs,
+	registerConsolidationTrigger,
+} from "../src/hooks/consolidation-trigger.js";
+import {
+	OBSERVER_FAILURE_BACKOFF_BASE_MS,
+	OBSERVER_FAILURE_BACKOFF_MAX_MS,
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_OBSERVER_COMPLETED,
+	OM_OBSERVER_FAILED,
 	OM_REFLECTIONS_RECORDED,
 } from "../src/session-ledger/index.js";
 import {
@@ -30,11 +37,16 @@ import {
 	type TestEntry,
 } from "./fixtures/session.js";
 
+function recorded(observations: unknown[]) {
+	return { kind: "recorded" as const, observations, attempts: 1 };
+}
+
 beforeEach(() => {
+	vi.useRealTimers();
 	mockAgents.runObserver.mockReset();
 	mockAgents.runReflector.mockReset();
 	mockAgents.runDropper.mockReset();
-	mockAgents.runObserver.mockResolvedValue(undefined);
+	mockAgents.runObserver.mockResolvedValue({ kind: "empty", attempts: 1 });
 	mockAgents.runReflector.mockResolvedValue(undefined);
 	mockAgents.runDropper.mockResolvedValue(undefined);
 });
@@ -134,6 +146,12 @@ function setup(args: {
 }
 
 describe("V3 consolidation trigger", () => {
+	it("bounds exponential observer failure backoff", () => {
+		expect(observerFailureDelayMs(1)).toBe(OBSERVER_FAILURE_BACKOFF_BASE_MS);
+		expect(observerFailureDelayMs(2)).toBe(OBSERVER_FAILURE_BACKOFF_BASE_MS * 2);
+		expect(observerFailureDelayMs(100)).toBe(OBSERVER_FAILURE_BACKOFF_MAX_MS);
+	});
+
 	const obsA = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
 	const obsB = observation("bbbbbbbbbbbb", { sourceEntryIds: ["raw-2"], tokenCount: 10 });
 	const refA = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
@@ -212,7 +230,7 @@ describe("V3 consolidation trigger", () => {
 
 	it("runs observer first and appends source-addressed observations", async () => {
 		const obs = observation("cccccccccccc", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
-		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obs]));
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
 		const { fire, runLaunchedWork, pi, runtime } = setup({ entries, reflectAfterTokens: 999 });
 
@@ -230,7 +248,7 @@ describe("V3 consolidation trigger", () => {
 
 	it("forwards OAuth-shaped auth (headers, no apiKey) to the observer agent", async () => {
 		const obs = observation("cccccccccccc", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
-		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obs]));
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
 		const { fire, runLaunchedWork, pi, runtime } = setup({ entries, reflectAfterTokens: 999 });
 		runtime.resolveModel.mockResolvedValueOnce({
@@ -253,7 +271,7 @@ describe("V3 consolidation trigger", () => {
 	it("uses existing observation coverage and retries larger ranges after no-output", async () => {
 		const prior = observation("cccccccccccc", { sourceEntryIds: ["raw-1"] });
 		const newObs = observation("dddddddddddd", { sourceEntryIds: ["raw-2"] });
-		mockAgents.runObserver.mockResolvedValueOnce([newObs]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([newObs]));
 		const entries = [
 			textCustomMessage("raw-1", "aaaa"),
 			observationsRecordedEntry("om-prior", { observations: [prior], coversUpToId: "raw-1" }),
@@ -269,21 +287,25 @@ describe("V3 consolidation trigger", () => {
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, { observations: [newObs], coversUpToId: "raw-3" });
 	});
 
-	it("observer no-output appends nothing and does not fake observation coverage", async () => {
+	it("persists explicit empty completion without recording observations", async () => {
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
 		const { fire, runLaunchedWork, pi } = setup({ entries });
 
 		fire();
 		await runLaunchedWork();
 
-		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_COMPLETED, {
+			outcome: "empty",
+			coversUpToId: "raw-1",
+		});
+		expect(pi.appendEntry).not.toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.anything());
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
 	});
 
 	it("shows routine worker notifications by default", async () => {
 		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
-		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obsA]));
 		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
 		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
@@ -302,7 +324,7 @@ describe("V3 consolidation trigger", () => {
 
 	it("suppresses routine worker notifications without hiding warnings", async () => {
 		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
-		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obsA]));
 		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
 		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
@@ -318,7 +340,7 @@ describe("V3 consolidation trigger", () => {
 
 		// Deliberate empty is routine info: also hidden when quiet.
 		mockAgents.runObserver.mockReset();
-		mockAgents.runObserver.mockResolvedValueOnce(undefined);
+		mockAgents.runObserver.mockResolvedValueOnce({ kind: "empty", attempts: 1 });
 		const noOutput = setup({ entries, reflectAfterTokens: 999, showWorkerNotifications: false });
 
 		noOutput.fire();
@@ -339,68 +361,115 @@ describe("V3 consolidation trigger", () => {
 		expect(failed.ctx.ui.notify.mock.calls[0][0]).toContain("observer failed");
 	});
 
-	it("reports deliberate empty as info, not a warning", async () => {
+	it("reports explicit empty as info and advances coverage", async () => {
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
-		const { fire, runLaunchedWork, ctx } = setup({ entries, reflectAfterTokens: 999 });
+		const { fire, runLaunchedWork, ctx, pi } = setup({ entries, reflectAfterTokens: 999 });
 
 		fire();
 		await runLaunchedWork();
 
 		expect(ctx.ui.notify.mock.calls).toEqual([
 			[expect.stringMatching(/^Observational memory: observer running on ~\d+-token chunk$/), "info"],
-			["Observational memory: observer found nothing new in this chunk (coverage unchanged; will retry later)", "info"],
+			["Observational memory: observer confirmed nothing new in this chunk (coverage advanced)", "info"],
 		]);
-	});
-
-	it("backs off observer re-fires after a deliberate empty until enough new tokens arrive", async () => {
-		const entries = [textCustomMessage("raw-1", "a".repeat(40))]; // 10 tokens
-		const { fire, runLaunchedWork, addEntries, runtime } = setup({ entries, observeAfterTokens: 10, reflectAfterTokens: 999 });
-
-		fire();
-		await runLaunchedWork();
-		expect(mockAgents.runObserver).toHaveBeenCalledTimes(1);
-		expect(runtime.observerEmptyBackoff).toEqual({
-			sessionIdentity: "session-1",
-			coverageId: undefined,
-			tokensAtEmpty: 10,
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_COMPLETED, {
+			outcome: "empty",
+			coversUpToId: "raw-1",
 		});
-
-		// Same span, only 5 new tokens (< observeAfterTokens more): no re-fire.
-		addEntries(textCustomMessage("raw-2", "b".repeat(20)));
-		runtime.consolidationInFlight = false;
-		fire();
-		expect(runtime.launchConsolidationTask).toHaveBeenCalledTimes(2);
-		await runLaunchedWork();
-		expect(mockAgents.runObserver).toHaveBeenCalledTimes(1);
-
-		// 10 more new tokens: backoff satisfied, observer re-fires over the grown span.
-		addEntries(textCustomMessage("raw-3", "c".repeat(40)));
-		runtime.consolidationInFlight = false;
-		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
-		fire();
-		await runLaunchedWork();
-		expect(mockAgents.runObserver).toHaveBeenCalledTimes(2);
-		expect(runtime.observerEmptyBackoff).toBeUndefined();
 	});
 
-	it("does not apply deliberate-empty backoff to another session", async () => {
-		const entries = [textCustomMessage("raw-1", "a".repeat(40))];
-		const { fire, runLaunchedWork, runtime, setSessionId } = setup({
-			entries,
+	it("does not re-observe explicit-empty coverage after a runtime restart", async () => {
+		const first = setup({
+			entries: [textCustomMessage("raw-1", "a".repeat(40))],
 			observeAfterTokens: 10,
 			reflectAfterTokens: 999,
 		});
 
-		fire();
-		await runLaunchedWork();
+		first.fire();
+		await first.runLaunchedWork();
+		expect(mockAgents.runObserver).toHaveBeenCalledTimes(1);
+		expect(first.pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_COMPLETED, {
+			outcome: "empty",
+			coversUpToId: "raw-1",
+		});
+
+		const restarted = setup({
+			entries: first.getEntries(),
+			observeAfterTokens: 10,
+			reflectAfterTokens: 999,
+		});
+		restarted.fire();
+		expect(restarted.runtime.launchConsolidationTask).not.toHaveBeenCalled();
 		expect(mockAgents.runObserver).toHaveBeenCalledTimes(1);
 
-		runtime.consolidationInFlight = false;
-		setSessionId("session-2");
-		fire();
-		await runLaunchedWork();
+		restarted.addEntries(textCustomMessage("raw-2", "b".repeat(20)));
+		restarted.fire();
+		expect(restarted.runtime.launchConsolidationTask).not.toHaveBeenCalled();
 
+		restarted.addEntries(textCustomMessage("raw-3", "c".repeat(40)));
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obsA]));
+		restarted.fire();
+		await restarted.runLaunchedWork();
 		expect(mockAgents.runObserver).toHaveBeenCalledTimes(2);
+		expect(mockAgents.runObserver).toHaveBeenLastCalledWith(expect.objectContaining({
+			allowedSourceEntryIds: ["raw-2", "raw-3"],
+		}));
+	});
+
+	it("persists failed-outcome backoff across restart and retries after cooldown", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-05-02T10:00:00.000Z"));
+		mockAgents.runObserver.mockResolvedValueOnce({
+			kind: "failed",
+			reason: "no_structured_outcome",
+			attempts: 2,
+			rejected: 0,
+		});
+		const first = setup({ entries: [textCustomMessage("raw-1", "a".repeat(40))], reflectAfterTokens: 1 });
+
+		first.fire();
+		await first.runLaunchedWork();
+		expect(first.pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_FAILED, expect.objectContaining({
+			reason: "no_structured_outcome",
+			coversUpToId: "raw-1",
+			consecutiveFailures: 1,
+			retryAt: Date.now() + OBSERVER_FAILURE_BACKOFF_BASE_MS,
+		}));
+		expect(first.pi.appendEntry).not.toHaveBeenCalledWith(OM_OBSERVER_COMPLETED, expect.anything());
+		expect(first.pi.appendEntry).not.toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.anything());
+
+		mockAgents.runObserver.mockReset();
+		mockAgents.runObserver.mockResolvedValueOnce({
+			kind: "failed",
+			reason: "no_structured_outcome",
+			attempts: 2,
+			rejected: 0,
+		});
+		const restarted = setup({ entries: first.getEntries(), reflectAfterTokens: 1 });
+		restarted.fire();
+		expect(restarted.runtime.launchConsolidationTask).not.toHaveBeenCalled();
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+
+		vi.advanceTimersByTime(OBSERVER_FAILURE_BACKOFF_BASE_MS);
+		restarted.fire();
+		await restarted.runLaunchedWork();
+		expect(mockAgents.runObserver).toHaveBeenCalledOnce();
+		expect(restarted.pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_FAILED, expect.objectContaining({
+			consecutiveFailures: 2,
+			retryAt: Date.now() + OBSERVER_FAILURE_BACKOFF_BASE_MS * 2,
+		}));
+
+		mockAgents.runObserver.mockReset();
+		mockAgents.runObserver.mockResolvedValue(recorded([obsA]));
+		const restartedAgain = setup({ entries: restarted.getEntries(), reflectAfterTokens: 1 });
+		restartedAgain.fire();
+		expect(restartedAgain.runtime.launchConsolidationTask).not.toHaveBeenCalled();
+
+		vi.advanceTimersByTime(OBSERVER_FAILURE_BACKOFF_BASE_MS * 2);
+		restartedAgain.fire();
+		await restartedAgain.runLaunchedWork();
+		expect(mockAgents.runObserver).toHaveBeenCalledOnce();
+		expect(restartedAgain.pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.anything());
 	});
 
 	it("surfaces API stream errors as observer failure, never as empty", async () => {
@@ -413,12 +482,15 @@ describe("V3 consolidation trigger", () => {
 
 		expect(runtime.lastObserverError).toContain("prompt is too long");
 		expect(ctx.ui.notify).toHaveBeenCalledWith(
-			'Observational memory: observer failed: observer stream ended with stopReason "error": prompt is too long: 5198507 tokens > 1000000 maximum',
+			expect.stringContaining('observer stream ended with stopReason "error": prompt is too long: 5198507 tokens > 1000000 maximum; coverage unchanged; retrying after 30 seconds'),
 			"warning",
 		);
 		expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("no observations"), expect.anything());
-		expect(pi.appendEntry).not.toHaveBeenCalled();
-		expect(runtime.observerEmptyBackoff).toBeUndefined();
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_FAILED, expect.objectContaining({
+			reason: "stream_error",
+			coversUpToId: "raw-1",
+		}));
+		expect(pi.appendEntry).not.toHaveBeenCalledWith(OM_OBSERVER_COMPLETED, expect.anything());
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 	});
 
@@ -436,7 +508,7 @@ describe("V3 consolidation trigger", () => {
 	});
 
 	it("re-reads branch so observer append can unblock reflector in the same consolidation run", async () => {
-		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obsA]));
 		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
 		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
@@ -641,12 +713,16 @@ describe("V3 consolidation trigger", () => {
 		const observerFailure = setup({ entries: [textCustomMessage("raw-1", "aaaaaaaa")] });
 		observerFailure.fire();
 		await observerFailure.runLaunchedWork();
-		expect(observerFailure.runtime.lastObserverError).toBe("observe failed");
+		expect(observerFailure.runtime.lastObserverError).toContain("observe failed; coverage unchanged; retrying after 30 seconds");
+		expect(observerFailure.pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVER_FAILED, expect.objectContaining({
+			reason: "execution_error",
+			coversUpToId: "raw-1",
+		}));
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
 
 		mockAgents.runObserver.mockReset();
-		mockAgents.runObserver.mockResolvedValue(undefined);
+		mockAgents.runObserver.mockResolvedValue({ kind: "empty", attempts: 1 });
 		mockAgents.runReflector.mockReset();
 		mockAgents.runReflector.mockRejectedValueOnce(new Error("reflect failed"));
 		const reflectorFailure = setup({ entries: [textCustomMessage("raw-1", "aaaaaaaa"), observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" })], observeAfterTokens: 999 });
@@ -674,7 +750,7 @@ describe("observer chunk cap", () => {
 	it("caps an oversized backlog and drains it incrementally across runs", async () => {
 		const first = observation("111111111111", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
 		const second = observation("222222222222", { sourceEntryIds: ["raw-2"], tokenCount: 4 });
-		mockAgents.runObserver.mockResolvedValueOnce([first]).mockResolvedValueOnce([second]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([first])).mockResolvedValueOnce(recorded([second]));
 		const entries = [
 			textCustomMessage("raw-1", "a".repeat(800)),
 			textCustomMessage("raw-2", "b".repeat(800)),
@@ -701,7 +777,7 @@ describe("observer chunk cap", () => {
 	it("bounds one oversized tool result, preserves provenance, and continues on the next run", async () => {
 		const first = observation("333333333333", { sourceEntryIds: ["raw-huge"], tokenCount: 4 });
 		const second = observation("555555555555", { sourceEntryIds: ["raw-next"], tokenCount: 4 });
-		mockAgents.runObserver.mockResolvedValueOnce([first]).mockResolvedValueOnce([second]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([first])).mockResolvedValueOnce(recorded([second]));
 		const hugeText = `HEAD:${"m".repeat(2_000)}:TAIL`;
 		const entries: TestEntry[] = [
 			{
@@ -745,7 +821,7 @@ describe("observer chunk cap", () => {
 
 	it("derives the cap from the resolved model's context window when not configured", async () => {
 		const obs = observation("444444444444", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
-		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obs]));
 		const entries = [
 			textCustomMessage("raw-1", "a".repeat(800)),
 			textCustomMessage("raw-2", "b".repeat(800)),

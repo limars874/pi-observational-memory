@@ -53,6 +53,9 @@ describe("runObserver", () => {
 		expect(systemPrompt).toContain("Frame state changes as supersession");
 		expect(systemPrompt).toContain("sourceEntryIds");
 		expect(systemPrompt).toContain("zero observations");
+		expect(systemPrompt).toContain("MUST still call record_observations");
+		expect(systemPrompt).toContain("Plain-text confirmation without a tool call is a failed outcome");
+		expect(systemPrompt).not.toContain("simply do not call the tool");
 		expect(systemPrompt).toContain("The dropper will drop these first");
 		expect(systemPrompt).toContain("highest-resistance, load-bearing observations");
 		expect(systemPrompt).not.toContain("will NEVER be dropped");
@@ -67,27 +70,34 @@ describe("runObserver", () => {
 			});
 		});
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const outcome = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0]).toMatchObject({
+		expect(outcome.kind).toBe("recorded");
+		if (outcome.kind !== "recorded") throw new Error("expected recorded outcome");
+		expect(outcome.observations).toHaveLength(1);
+		expect(outcome.observations[0]).toMatchObject({
 			content,
 			timestamp: "2026-05-02 10:30",
 			relevance: "high",
 			sourceEntryIds: ["entry-a"],
 		});
-		expect(observations?.[0].id).toMatch(/^[a-f0-9]{12}$/);
-		expect(observations?.[0].tokenCount).toBe(observationLineTokenCount(observations![0]));
+		expect(outcome.observations[0].id).toMatch(/^[a-f0-9]{12}$/);
+		expect(outcome.observations[0].tokenCount).toBe(observationLineTokenCount(outcome.observations[0]));
 	});
 
-	it("rejects invented source ids and returns no observations", async () => {
+	it("classifies invented source ids as a rejected structured outcome", async () => {
 		const loop = fakeAgentLoop(async (_prompts, context) => {
 			await context.tools[0].execute("tool-1", {
 				observations: [{ timestamp: "2026-05-02 10:30", content: "Bad source", relevance: "medium", sourceEntryIds: ["missing"] }],
 			});
 		});
 
-		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toEqual({
+			kind: "failed",
+			reason: "rejected_observations",
+			attempts: 1,
+			rejected: 1,
+		});
 	});
 
 	it("dedupes deterministic ids", async () => {
@@ -100,15 +110,65 @@ describe("runObserver", () => {
 			});
 		});
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const outcome = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0].content).toBe("Same content");
+		expect(outcome.kind).toBe("recorded");
+		if (outcome.kind !== "recorded") throw new Error("expected recorded outcome");
+		expect(outcome.observations).toHaveLength(1);
+		expect(outcome.observations[0].content).toBe("Same content");
 	});
 
-	it("returns undefined when no tool call records observations", async () => {
-		const loop = fakeAgentLoop(() => {});
-		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+	it("accepts only an explicit empty tool call as an empty outcome", async () => {
+		const loop = fakeAgentLoop(async (_prompts, context) => {
+			await context.tools[0].execute("tool-1", { observations: [] });
+		});
+
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toEqual({ kind: "empty", attempts: 1 });
+	});
+
+	it("does not let an explicit empty call mask rejected proposals", async () => {
+		const loop = fakeAgentLoop(async (_prompts, context) => {
+			await context.tools[0].execute("tool-1", { observations: [] });
+			await context.tools[0].execute("tool-2", {
+				observations: [{ timestamp: "2026-05-02 10:30", content: "Bad source", relevance: "medium", sourceEntryIds: ["missing"] }],
+			});
+		});
+
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toEqual({
+			kind: "failed",
+			reason: "rejected_observations",
+			attempts: 1,
+			rejected: 1,
+		});
+	});
+
+	it("recovers a first no-tool response with one corrective empty outcome", async () => {
+		let calls = 0;
+		const loop = fakeAgentLoop(async (_prompts, context) => {
+			calls++;
+			if (calls === 2) await context.tools[0].execute("tool-1", { observations: [] });
+		});
+
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toEqual({ kind: "empty", attempts: 2 });
+		expect(calls).toBe(2);
+	});
+
+	it("retries one no-tool response and then returns a structured failure", async () => {
+		let calls = 0;
+		let retryPrompt = "";
+		const loop = fakeAgentLoop((prompts) => {
+			calls++;
+			if (calls === 2) retryPrompt = prompts.at(-1)?.content?.[0]?.text ?? "";
+		});
+
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toEqual({
+			kind: "failed",
+			reason: "no_structured_outcome",
+			attempts: 2,
+			rejected: 0,
+		});
+		expect(calls).toBe(2);
+		expect(retryPrompt).toContain("{\"observations\": []}");
 	});
 
 	it("throws ObserverStreamError when the stream errors with nothing recorded", async () => {
@@ -128,10 +188,12 @@ describe("runObserver", () => {
 			});
 		}, [assistantEndEvent("error", "gateway timeout")]);
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const outcome = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0].content).toBe("Kept despite later error");
+		expect(outcome.kind).toBe("recorded");
+		if (outcome.kind !== "recorded") throw new Error("expected recorded outcome");
+		expect(outcome.observations).toHaveLength(1);
+		expect(outcome.observations[0].content).toBe("Kept despite later error");
 	});
 
 	it("uses maxTurns as an observer turn cap", async () => {

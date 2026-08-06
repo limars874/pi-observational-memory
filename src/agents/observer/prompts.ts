@@ -15,7 +15,7 @@ How you work:
 2. Read the conversation chunk and identify what new information it contains.
 3. Call record_observations with a batch covering part (or all) of the chunk.
 4. Read the progress receipt. If content remains uncovered, call again. You may call the tool many times.
-5. When the chunk is fully covered, STOP calling the tool and reply with a brief plain-text confirmation (one short sentence). That ends the run.
+5. When the chunk is fully covered, stop. If the chunk warrants zero new observations, you MUST still call record_observations once with {"observations": []}. Plain-text confirmation without a tool call is a failed outcome.
 
 What to emit:
 - Produce NEW observations for the new chunk only. Do not restate facts already present in reflections or current observations unless something has materially changed.
@@ -24,7 +24,7 @@ What to emit:
 - Never invent source entry ids. Use only ids printed in the chunk. If an observation spans multiple turns or tool results, include every supporting source entry id.
 - Observations with missing, empty, or invalid sourceEntryIds will be rejected and not recorded, so do not call record_observations until you can cite valid source ids.
 - Group repeated similar tool calls into a single observation rather than one per call.
-- Skip routine, low-information events. It is fine to emit zero observations if the chunk carries no new information — in that case, simply do not call the tool and end with a plain-text confirmation.
+- Skip routine, low-information events. It is fine to emit zero observations if the chunk carries no new information. In that case, call record_observations with an empty observations array so the empty verdict is explicit and durable.
 
 Observation content rules:
 
@@ -116,4 +116,4 @@ Do NOT default to "critical" or "high". Most observations are medium or low. Res
 
 Timestamp format: "YYYY-MM-DD HH:MM" (local time, 24-hour, to the minute). This goes in the timestamp field, not the content.
 
-Remember: these observations are the assistant's ONLY memory of this chunk once the raw messages fall out of context. Make them count.`;
+Remember: these observations are the assistant's ONLY memory of this chunk once the raw messages fall out of context. Every run must end with a structured record_observations outcome, including an explicit empty array when there is nothing to record. Make them count.`;

@@ -1,4 +1,6 @@
 export const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
+export const OM_OBSERVER_COMPLETED = "om.observer.completed";
+export const OM_OBSERVER_FAILED = "om.observer.failed";
 export const OM_REFLECTIONS_RECORDED = "om.reflections.recorded";
 export const OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
 export const OM_FOLDED = "om.folded";
@@ -41,6 +43,33 @@ export type Reflection = {
 export type ObservationsRecordedEntryData = {
 	observations: Observation[];
 	coversUpToId: string;
+};
+
+export type ObserverCompletedEntryData = {
+	outcome: "empty";
+	coversUpToId: string;
+};
+
+export const OBSERVER_FAILURE_BACKOFF_BASE_MS = 30_000;
+export const OBSERVER_FAILURE_BACKOFF_MAX_MS = 15 * 60_000;
+export const OBSERVER_FAILURE_DETAIL_MAX_CHARS = 2_000;
+
+export const OBSERVER_FAILURE_REASONS = [
+	"no_structured_outcome",
+	"rejected_observations",
+	"stream_error",
+	"execution_error",
+] as const;
+export type ObserverFailureReason = (typeof OBSERVER_FAILURE_REASONS)[number];
+
+export type ObserverFailedEntryData = {
+	reason: ObserverFailureReason;
+	coversUpToId: string;
+	coverageId?: string;
+	failedAt: number;
+	retryAt: number;
+	consecutiveFailures: number;
+	detail?: string;
 };
 
 export type ReflectionsRecordedEntryData = {
@@ -86,6 +115,10 @@ function isTokenCount(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+function isObserverFailureReason(value: unknown): value is ObserverFailureReason {
+	return typeof value === "string" && (OBSERVER_FAILURE_REASONS as readonly string[]).includes(value);
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object";
 }
@@ -120,6 +153,31 @@ export function isObservationsRecordedData(value: unknown): value is Observation
 		value.observations.length > 0 &&
 		value.observations.every(isObservation) &&
 		isNonEmptyString(value.coversUpToId)
+	);
+}
+
+export function isObserverCompletedData(value: unknown): value is ObserverCompletedEntryData {
+	if (!isPlainRecord(value)) return false;
+	return value.outcome === "empty" && isNonEmptyString(value.coversUpToId);
+}
+
+export function isObserverFailedData(value: unknown): value is ObserverFailedEntryData {
+	if (!isPlainRecord(value)) return false;
+	return (
+		isObserverFailureReason(value.reason) &&
+		isNonEmptyString(value.coversUpToId) &&
+		(value.coverageId === undefined || isNonEmptyString(value.coverageId)) &&
+		typeof value.failedAt === "number" &&
+		Number.isFinite(value.failedAt) &&
+		value.failedAt >= 0 &&
+		typeof value.retryAt === "number" &&
+		Number.isFinite(value.retryAt) &&
+		value.retryAt >= value.failedAt &&
+		value.retryAt - value.failedAt <= OBSERVER_FAILURE_BACKOFF_MAX_MS &&
+		typeof value.consecutiveFailures === "number" &&
+		Number.isInteger(value.consecutiveFailures) &&
+		value.consecutiveFailures >= 1 &&
+		(value.detail === undefined || (isNonEmptyString(value.detail) && value.detail.length <= OBSERVER_FAILURE_DETAIL_MAX_CHARS))
 	);
 }
 
@@ -159,6 +217,22 @@ export function isObservationsRecordedEntry(entry: Entry): entry is Entry & {
 	return entry.type === "custom" && entry.customType === OM_OBSERVATIONS_RECORDED && isObservationsRecordedData(entry.data);
 }
 
+export function isObserverCompletedEntry(entry: Entry): entry is Entry & {
+	type: "custom";
+	customType: typeof OM_OBSERVER_COMPLETED;
+	data: ObserverCompletedEntryData;
+} {
+	return entry.type === "custom" && entry.customType === OM_OBSERVER_COMPLETED && isObserverCompletedData(entry.data);
+}
+
+export function isObserverFailedEntry(entry: Entry): entry is Entry & {
+	type: "custom";
+	customType: typeof OM_OBSERVER_FAILED;
+	data: ObserverFailedEntryData;
+} {
+	return entry.type === "custom" && entry.customType === OM_OBSERVER_FAILED && isObserverFailedData(entry.data);
+}
+
 export function isReflectionsRecordedEntry(entry: Entry): entry is Entry & {
 	type: "custom";
 	customType: typeof OM_REFLECTIONS_RECORDED;
@@ -181,6 +255,17 @@ export function buildObservationsRecordedData(
 ): ObservationsRecordedEntryData | undefined {
 	if (observations.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
 	return { observations, coversUpToId };
+}
+
+export function buildObserverCompletedData(coversUpToId: string): ObserverCompletedEntryData | undefined {
+	if (!isNonEmptyString(coversUpToId)) return undefined;
+	return { outcome: "empty", coversUpToId };
+}
+
+export function buildObserverFailedData(
+	data: ObserverFailedEntryData,
+): ObserverFailedEntryData | undefined {
+	return isObserverFailedData(data) ? data : undefined;
 }
 
 export function buildReflectionsRecordedData(
