@@ -57,7 +57,7 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `observeAfterTokens` | positive integer | `10000` | Raw/source token threshold for observer runs. |
 | `reflectAfterTokens` | positive integer | `20000` | Raw/source token threshold for reflector runs; successful reflection creates dropper maintenance opportunities. |
 | `observerChunkMaxTokens` | positive integer | derived; minimum `256` | Maximum estimated tokens sent to one observer run. Unset: 20% of the resolved memory model's context window, or `60000` when unknown. |
-| `compactAfterTokens` | positive integer | `81000` | Raw/source token threshold for proactive auto-compaction. |
+| `compactAfterTokens` | positive integer | `81000` | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. |
 | `observationsPoolMaxTokens` | positive integer | `20000` | Normal compaction-projection observation-token pressure that makes compaction do a full fold. |
 | `observationsPoolTargetTokens` | positive integer below max | half of `observationsPoolMaxTokens` | Folded active observation target used by post-reflection dropper maintenance. |
 | `agentMaxTurns` | positive integer | `16` | Shared nested-agent turn cap for observer, reflector, and dropper. |
@@ -69,7 +69,7 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
 
-Valid `model.thinking` values are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
+Valid `model.thinking` values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 
 Invalid values are ignored. Positive-integer settings must be finite integers greater than zero. `observationsPoolTargetTokens` must also be below `observationsPoolMaxTokens`; if omitted or invalid, it is derived as `Math.floor(observationsPoolMaxTokens / 2)`.
 
@@ -103,9 +103,9 @@ Lower values distill reflections more often and therefore create more opportunit
 
 Default: `81000`.
 
-The auto-compaction trigger runs from Pi's `agent_end` hook. It counts raw/source tokens after the latest compaction boundary. If the count reaches `compactAfterTokens`, the extension defers with `setTimeout(0)`, checks that Pi is idle, re-checks the threshold, and calls `ctx.compact()`.
+The auto-compaction trigger runs from Pi's `agent_settled` hook, after retries, automatic compaction, and queued continuation finish. It counts estimated source-entry tokens after the latest compaction boundary. The count starts at `firstKeptEntryId` when Pi provides that boundary, so retained source entries remain part of the metric. Memory ledger entries and compaction metadata contribute zero. If the count reaches `compactAfterTokens`, the extension defers with `setTimeout(0)`, checks that Pi is idle, re-checks the same metric, and calls `ctx.compact()`. Pi's provider context usage is not used for this threshold.
 
-This trigger does not wait for observer, reflector, or dropper work. Actual compaction summary creation happens later in `session_before_compact`, where V3 compaction is deterministic and model-free.
+This trigger does not wait for observer, reflector, or dropper work. Actual compaction summary creation happens later in `session_before_compact`. A non-empty V3 projection is rendered deterministically and model-free; an empty projection delegates to Pi's native summarizer so prior context is not replaced by an empty summary.
 
 Pi's own window-pressure compaction and manual compaction can still happen independently of this proactive trigger.
 

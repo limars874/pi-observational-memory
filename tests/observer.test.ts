@@ -80,6 +80,8 @@ describe("runObserver", () => {
 			timestamp: "2026-05-02 10:30",
 			relevance: "high",
 			sourceEntryIds: ["entry-a"],
+			// tokenCount is code-computed from the full rendered line (id + timestamp + relevance + content).
+			tokenCount: 18,
 		});
 		expect(outcome.observations[0].id).toMatch(/^[a-f0-9]{12}$/);
 		expect(outcome.observations[0].tokenCount).toBe(observationLineTokenCount(outcome.observations[0]));

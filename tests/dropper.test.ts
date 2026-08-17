@@ -171,7 +171,8 @@ describe("V3 dropper agent", () => {
 			await context.tools[0].execute("tool-1", { ids: ["aaaaaaaaaaaa", "missing", "bbbbbbbbbbbb"] });
 		});
 
-		await expect(runDropper({ ...baseArgs, agentLoop: loop })).resolves.toEqual(["aaaaaaaaaaaa"]);
+		// Rendered-line pool is 90 tokens; a 40-token target allows 2 drops by the average-token cap.
+		await expect(runDropper({ ...baseArgs, targetTokens: 40, agentLoop: loop })).resolves.toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
 	});
 
 	it("returns critical proposed ids when they are the selected valid candidates", async () => {
@@ -196,7 +197,8 @@ describe("V3 dropper agent", () => {
 			await context.tools[0].execute("tool-2", { ids: ["bbbbbbbbbbbb", "aaaaaaaaaaaa"] });
 		});
 
-		await expect(runDropper({ ...baseArgs, agentLoop: loop })).resolves.toEqual(["aaaaaaaaaaaa"]);
+		// Rendered-line pool is 90 tokens; a 40-token target allows 2 drops by the average-token cap.
+		await expect(runDropper({ ...baseArgs, targetTokens: 40, agentLoop: loop })).resolves.toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
 	});
 
 	it("returns undefined when no tool call drops observations", async () => {

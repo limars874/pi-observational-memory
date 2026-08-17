@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { observationPoolMetrics } from "../src/agents/dropper/pool.js";
+import { observationLineTokenCount } from "../src/tokens.js";
 import { foldLedger } from "../src/session-ledger/index.js";
 import { observationWithLineTokens, observationsDroppedEntry, observationsRecordedEntry, textCustomMessage } from "./fixtures/session.js";
 
@@ -8,6 +9,8 @@ describe("V3 dropper active observation pool metrics", () => {
 	it("reports below-target pools as not ready", () => {
 		const observations = [observationWithLineTokens("aaaaaaaaaaaa", 20, { relevance: "low" })];
 
+		// Pool metrics count the full rendered line (id + timestamp + relevance + content).
+		expect(observationLineTokenCount(observations[0]!)).toBe(20);
 		expect(observationPoolMetrics(observations, 100)).toMatchObject({
 			observationTokens: 20,
 			targetTokens: 100,
@@ -21,6 +24,7 @@ describe("V3 dropper active observation pool metrics", () => {
 	});
 
 	it("reports at-target pools as not ready", () => {
+		// Pad content so each rendered line is exactly 50 tokens (200 chars).
 		const observations = [
 			observationWithLineTokens("aaaaaaaaaaaa", 50, { relevance: "low" }),
 			observationWithLineTokens("bbbbbbbbbbbb", 50, { relevance: "medium" }),
@@ -37,6 +41,7 @@ describe("V3 dropper active observation pool metrics", () => {
 	});
 
 	it("reports above-target pools as ready with target-return max drops", () => {
+		// Pad content so each rendered line is exactly 50 tokens (200 chars).
 		const observations = [
 			observationWithLineTokens("aaaaaaaaaaaa", 50, { relevance: "low" }),
 			observationWithLineTokens("bbbbbbbbbbbb", 50, { relevance: "medium" }),

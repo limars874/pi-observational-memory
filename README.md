@@ -173,6 +173,8 @@ This extension is especially useful when the session contains decisions that sho
 
 ## Install
 
+Requires Pi 0.81.0 or newer. Proactive compaction uses the `agent_settled` lifecycle event introduced in that release.
+
 ```bash
 pi install npm:pi-observational-memory
 ```
@@ -230,9 +232,9 @@ Most users can start with the defaults and tune only if they have a specific rea
 ### Scaling compaction to the model's context window
 
 By default `compactAfterTokensMode` is `"calibrated"`, so the proactive
-compaction trigger fires at the fixed `compactAfterTokens` value (81,000 by
-default). That is backwards-compatible and works well for typical ~128K–200K
-context models.
+compaction trigger uses the fixed `compactAfterTokens` estimated source-entry
+threshold (81,000 by default). This preserves the pre-PR #40 compaction metric
+for typical ~128K–200K context models.
 
 On a large-context model (e.g. 1M tokens) the calibrated default preempts
 compaction at ~81K, wasting most of the window. Switch to `"ratio"` mode to let
@@ -250,8 +252,11 @@ the trigger scale with the active model's `contextWindow`:
 
 In ratio mode the effective threshold is
 `floor(model.contextWindow * compactAfterTokensRatio)` (clamped to a minimum of
-1). With the example above, a 1,000,000-token window compacts at ~500,000 raw
-tokens; a 200,000-token window compacts at ~100,000.
+1). With the example above, a 1,000,000-token window compacts after about
+500,000 estimated source-entry tokens after the latest compaction boundary; a
+200,000-token window uses about 100,000. The threshold counts source entries,
+not Pi's system prompt, tool schemas, or provider accounting. Pi's native
+window-pressure compaction remains independent.
 
 `compactAfterTokensRatio` is user-tunable precisely because **context window ≠
 attention**. Some models advertise a large window but degrade at long range; set
@@ -271,8 +276,8 @@ on the `Next compaction` line regardless of mode.
 | `observeAfterTokens`        | `10000`       | Raw/source token threshold for observation runs.                                                  |
 | `observerChunkMaxTokens`    | derived       | Max estimated tokens serialized into one observer chunk (minimum `256`). Unset: `floor(contextWindow * 0.2)` of the resolved memory model, or `60000` when the window is unknown. Larger backlogs drain oldest-first; a single over-budget source is sent as a marked head/tail excerpt while the original source remains in the session ledger. |
 | `reflectAfterTokens`        | `20000`       | Raw/source token threshold for reflection runs; successful reflection creates dropper opportunities. |
-| `compactAfterTokens`        | `81000`       | Raw/source token threshold for proactive auto-compaction (used directly in `"calibrated"` mode, and as the fallback in `"ratio"` mode). |
-| `compactAfterTokensMode`    | `"calibrated"`| `"calibrated"` uses `compactAfterTokens` directly (default, backwards-compatible). `"ratio"` scales the threshold by the active model's `contextWindow`. |
+| `compactAfterTokens`        | `81000`       | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. |
+| `compactAfterTokensMode`    | `"calibrated"`| `"calibrated"` uses `compactAfterTokens` directly. `"ratio"` scales the source-entry threshold by the active model's `contextWindow`. |
 | `compactAfterTokensRatio`   | `0.68`        | In `"ratio"` mode, the threshold is `floor(contextWindow * ratio)`. Tunable because large windows do not always mean strong long-range attention. Must be in `(0, 1)`. |
 | `observationsPoolMaxTokens` | `20000`       | Observation-token budget used for compaction full-fold pressure.                                  |
 | `observationsPoolTargetTokens` | half of max | Active observation target used by post-reflection dropper maintenance.                            |
@@ -290,6 +295,7 @@ Valid `model.thinking` values are:
 * `medium`
 * `high`
 * `xhigh`
+* `max`
 
 If no `model` is configured, memory workers use the session model.
 
@@ -325,14 +331,14 @@ flowchart TD
     Turn[turn_end]
     Observe[Capture observations]
     Reflect[Distill reflections]
-    AgentEnd[agent_end]
+    AgentSettled[agent_settled]
     Trigger[auto-compaction trigger]
     Compact[session_before_compact]
     Summary[visible memory for Pi]
 
     Turn -->|observation due| Observe
     Turn -->|reflection due| Reflect
-    AgentEnd -->|compactAfterTokens and idle| Trigger --> Compact --> Summary
+    AgentSettled -->|compactAfterTokens and idle| Trigger --> Compact --> Summary
 ```
 
 The high-level lifecycle:
@@ -345,6 +351,12 @@ The high-level lifecycle:
 
 The important part: compaction does not need to rethink the whole session from scratch.
 
+The proactive compaction threshold counts estimated source-entry tokens after
+the latest compaction boundary. It includes source entries retained by
+`firstKeptEntryId` and newer source entries, while memory ledger entries and
+compaction metadata contribute zero. `/om:status` uses the same metric. Pi's
+own window-pressure compaction remains independent.
+
 ---
 
 ## Current V3 behavior
@@ -353,7 +365,7 @@ Current behavior:
 
 * **Observation-centered memory.** The extension records useful session observations while you work.
 * **Durable reflections.** The extension distills stable facts that help the agent stay oriented over time.
-* **Fast compaction.** `session_before_compact` does not call a model or wait for background workers. It renders the current prepared memory state.
+* **Fast compaction.** When prepared V3 memory exists, `session_before_compact` renders it without calling a model or waiting for background workers. An empty V3 projection delegates to Pi's native summarizer instead of replacing prior context with an empty summary.
 * **Background memory work.** Observation and reflection work run from `turn_end` when their token clocks are due; dropper work runs only after successful reflection and prunes the folded active observation ledger toward `observationsPoolTargetTokens`.
 * **Source-backed recall.** Observations and reflections can be traced back through the `recall` tool.
 * **Visible/full views.** `/om:view` shows visible memory and `/om:view full` shows the full current memory state. Use `/om:status` for visible-vs-full drift and for the separate visible observation pool vs active observation pool.

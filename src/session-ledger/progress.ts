@@ -169,16 +169,9 @@ export function findLastCompactionIndex(entries: Entry[]): number {
 
 // ==== Real (provider-reported) token accounting ====
 //
-// The raw source-entry estimate (estimateEntryTokens) systematically undercounts
-// the live context: it omits the system prompt, tool schemas, thinking tokens,
-// and drifts from the provider's own tokenizer by ~20-46% in practice. Trigger
-// thresholds therefore compared an unknowable estimate against a configured
-// number, so "observe after 10000 tokens" fired at an unpredictable 11-19K real
-// tokens (and compaction could lag the visible footer percentage so far that it
-// never fired at all). These helpers measure real context growth from the
-// provider-reported usage attached to assistant/compaction entries — the same
-// basis the footer context percentage uses — so a configured threshold means
-// real tokens.
+// These helpers measure context growth from provider-reported usage for the
+// observation and reflection coverage clocks. Automatic compaction keeps its
+// separate raw source-entry clock because its setting counts ledger entries.
 
 type UsageLike = {
 	totalTokens?: number;
