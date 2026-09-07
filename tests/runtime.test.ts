@@ -79,6 +79,79 @@ describe("Runtime V3 behavior", () => {
 		expect(result).toEqual({ ok: true, model, apiKey: "sk-ant-key", headers: undefined });
 	});
 
+	it.each([
+		[{ provider: "opencode", baseUrl: "https://opencode.ai/zen/v1" }],
+		[{ provider: "opencode-go", baseUrl: "https://opencode.ai/zen/go/v1" }],
+		[{ provider: "custom-opencode", baseUrl: "https://opencode.ai/zen/go/v1" }],
+	])("adds Pi session headers for OpenCode models", async (model) => {
+		const runtime = new Runtime();
+		const registry = modelRegistry({ auth: { ok: true, apiKey: "key", headers: { "x-auth": "value" } } });
+
+		const result = await runtime.resolveModel({
+			model,
+			modelRegistry: registry,
+			sessionId: "session-123",
+			hasUI: false,
+		});
+
+		expect(result).toEqual({
+			ok: true,
+			model,
+			apiKey: "key",
+			sessionId: "session-123",
+			headers: {
+				"x-opencode-session": "session-123",
+				"x-opencode-client": "pi",
+				"x-auth": "value",
+			},
+		});
+	});
+
+	it("lets configured OpenCode headers override generated session headers", async () => {
+		const runtime = new Runtime();
+		const model = { provider: "opencode-go", baseUrl: "https://opencode.ai/zen/go/v1" };
+		const registry = modelRegistry({
+			auth: {
+				ok: true,
+				apiKey: "key",
+				headers: { "x-opencode-session": "configured-session", "x-opencode-client": "configured-client" },
+			},
+		});
+
+		const result = await runtime.resolveModel({
+			model,
+			modelRegistry: registry,
+			sessionId: "session-123",
+			hasUI: false,
+		});
+
+		expect(result).toMatchObject({
+			ok: true,
+			headers: { "x-opencode-session": "configured-session", "x-opencode-client": "configured-client" },
+		});
+	});
+
+	it("does not send Pi session headers to unrelated providers", async () => {
+		const runtime = new Runtime();
+		const model = { provider: "openai", baseUrl: "https://api.openai.com/v1" };
+		const registry = modelRegistry({ auth: { ok: true, apiKey: "key", headers: { "x-auth": "value" } } });
+
+		const result = await runtime.resolveModel({
+			model,
+			modelRegistry: registry,
+			sessionId: "session-123",
+			hasUI: false,
+		});
+
+		expect(result).toEqual({
+			ok: true,
+			model,
+			apiKey: "key",
+			sessionId: "session-123",
+			headers: { "x-auth": "value" },
+		});
+	});
+
 	it("rejects auth that carries neither apiKey nor usable headers", async () => {
 		const runtime = new Runtime();
 		const model = { provider: "xai" };

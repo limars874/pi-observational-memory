@@ -150,6 +150,7 @@ function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): (stage: "ob
 		cached ??= await runtime.resolveModel({
 			model: ctx.model,
 			modelRegistry: ctx.modelRegistry,
+			sessionId: debugSessionMetadata(ctx).sessionId,
 			hasUI: ctx.hasUI,
 			ui: ctx.ui,
 		});
@@ -390,6 +391,7 @@ async function runObserverStage(
 			model: resolved.model as any,
 			apiKey: resolved.apiKey,
 			headers: resolved.headers,
+			sessionId: resolved.sessionId,
 			priorReflections,
 			priorObservations,
 			chunk,
@@ -478,6 +480,7 @@ async function runReflectorStage(
 		model: resolved.model as any,
 		apiKey: resolved.apiKey,
 		headers: resolved.headers,
+		sessionId: resolved.sessionId,
 		reflections: folded.reflections,
 		observations: folded.activeObservations,
 		maxTurns: runtime.config.agentMaxTurns,
@@ -550,6 +553,7 @@ async function runDropperStage(
 		model: resolved.model as any,
 		apiKey: resolved.apiKey,
 		headers: resolved.headers,
+		sessionId: resolved.sessionId,
 		reflections: reflectionsForDropper,
 		observations: folded.activeObservations,
 		targetTokens: runtime.config.observationsPoolTargetTokens,

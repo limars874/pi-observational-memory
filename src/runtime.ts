@@ -1,8 +1,34 @@
 import { type Config, DEFAULTS, loadConfig } from "./config.js";
 
 export type ResolveResult =
-	| { ok: true; model: unknown; apiKey?: string; headers?: Record<string, string> }
+	| { ok: true; model: unknown; apiKey?: string; headers?: Record<string, string>; sessionId?: string }
 	| { ok: false; reason: string };
+
+const OPENCODE_HOST = "opencode.ai";
+
+function matchesHost(baseUrl: unknown, expectedHost: string): boolean {
+	if (typeof baseUrl !== "string") return false;
+	try {
+		return new URL(baseUrl).hostname === expectedHost;
+	} catch {
+		return false;
+	}
+}
+
+function mergeProviderSessionHeaders(
+	model: unknown,
+	sessionId: string | undefined,
+	headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+	if (!sessionId || !model || typeof model !== "object") return headers;
+	const { provider, baseUrl } = model as { provider?: unknown; baseUrl?: unknown };
+	if (provider !== "opencode" && provider !== "opencode-go" && !matchesHost(baseUrl, OPENCODE_HOST)) return headers;
+	return {
+		"x-opencode-session": sessionId,
+		"x-opencode-client": "pi",
+		...headers,
+	};
+}
 
 /**
  * Mirrors pi's own request-auth acceptance rule (`AgentSession._getRequiredRequestAuth`):
@@ -28,6 +54,7 @@ export type ConsolidationPhase = "observer" | "reflector" | "dropper";
 export interface ResolveCtx {
 	model: unknown;
 	modelRegistry: any;
+	sessionId?: string;
 	hasUI: boolean;
 	ui?: { notify: Notify };
 }
@@ -79,7 +106,14 @@ export class Runtime {
 				: `no API key or auth headers for provider "${provider}"`;
 			return { ok: false, reason };
 		}
-		return { ok: true, model, apiKey: auth.apiKey as string | undefined, headers: auth.headers as Record<string, string> | undefined };
+		const headers = mergeProviderSessionHeaders(model, ctx.sessionId, auth.headers as Record<string, string> | undefined);
+		return {
+			ok: true,
+			model,
+			apiKey: auth.apiKey as string | undefined,
+			headers,
+			...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+		};
 	}
 
 	launchConsolidationTask(ctx: LaunchCtx, work: () => Promise<void>): Promise<void> {

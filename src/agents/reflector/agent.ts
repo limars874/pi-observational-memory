@@ -23,6 +23,7 @@ interface RunReflectorArgs {
 	model: Model<any>;
 	apiKey?: string;
 	headers?: Record<string, string>;
+	sessionId?: string;
 	reflections: Reflection[];
 	observations: Observation[];
 	signal?: AbortSignal;
@@ -105,7 +106,7 @@ function normalizeReflectionContent(content: string): string | undefined {
 }
 
 export async function runReflector(args: RunReflectorArgs): Promise<Reflection[] | undefined> {
-	const { model, apiKey, headers, reflections, observations, signal } = args;
+	const { model, apiKey, headers, sessionId, reflections, observations, signal } = args;
 	if (observations.length === 0) return undefined;
 
 	const coverageById = reflectionCoverageMap(observations, reflections);
@@ -176,6 +177,7 @@ export async function runReflector(args: RunReflectorArgs): Promise<Reflection[]
 		model,
 		apiKey,
 		headers,
+		sessionId,
 		maxTokens: boundedMaxTokens(model, AGENT_LOOP_MAX_TOKENS),
 		convertToLlm: (msgs) => msgs as Message[],
 		toolExecution: "sequential",

@@ -15,6 +15,7 @@ interface RunObserverArgs {
 	model: Model<any>;
 	apiKey?: string;
 	headers?: Record<string, string>;
+	sessionId?: string;
 	priorReflections: string[];
 	priorObservations: string[];
 	chunk: string;
@@ -110,7 +111,7 @@ export function normalizeSourceEntryIds(
 }
 
 export async function runObserver(args: RunObserverArgs): Promise<ObserverOutcome> {
-	const { model, apiKey, headers, priorReflections, priorObservations, chunk, allowedSourceEntryIds, signal } = args;
+	const { model, apiKey, headers, sessionId, priorReflections, priorObservations, chunk, allowedSourceEntryIds, signal } = args;
 	const conversation = chunk.trim();
 	if (!conversation) return { kind: "failed", reason: "no_structured_outcome", attempts: 0, rejected: 0 };
 
@@ -211,6 +212,7 @@ ${conversation}`;
 			model,
 			apiKey,
 			headers,
+			sessionId,
 			maxTokens: boundedMaxTokens(model, AGENT_LOOP_MAX_TOKENS),
 			convertToLlm: (msgs) => msgs as Message[],
 			toolExecution: "sequential",

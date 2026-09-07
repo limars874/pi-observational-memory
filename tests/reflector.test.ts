@@ -204,6 +204,25 @@ describe("V3 reflector agent", () => {
 		expect(result?.map((item) => item.content)).toEqual(["New durable fact."]);
 	});
 
+	it("passes provider headers and session id to the reflector request", async () => {
+		let seenConfig: any;
+		const loop = fakeAgentLoop((_prompts, _context, config) => {
+			seenConfig = config;
+		});
+
+		await runReflector({
+			...baseArgs,
+			headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+			sessionId: "session-123",
+			agentLoop: loop,
+		});
+
+		expect(seenConfig).toMatchObject({
+			headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+			sessionId: "session-123",
+		});
+	});
+
 	it("returns undefined when no tool call records reflections", async () => {
 		const loop = fakeAgentLoop(() => {});
 		await expect(runReflector({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();

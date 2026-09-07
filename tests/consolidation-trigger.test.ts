@@ -268,6 +268,38 @@ describe("V3 consolidation trigger", () => {
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, { observations: [obs], coversUpToId: "raw-1" });
 	});
 
+	it("passes the current session identity through all worker stages", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runObserver.mockResolvedValueOnce(recorded([obsA]));
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, runtime } = setup({
+			entries,
+			observationsPoolTargetTokens: 5,
+			sessionId: "session-123",
+		});
+		runtime.resolveModel.mockResolvedValue({
+			ok: true,
+			model: { provider: "opencode-go", reasoning: true },
+			apiKey: "key",
+			headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+			sessionId: "session-123",
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(runtime.resolveModel).toHaveBeenCalledOnce();
+		expect(runtime.resolveModel).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "session-123" }));
+		for (const worker of [mockAgents.runObserver, mockAgents.runReflector, mockAgents.runDropper]) {
+			expect(worker).toHaveBeenCalledWith(expect.objectContaining({
+				headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+				sessionId: "session-123",
+			}));
+		}
+	});
+
 	it("uses existing observation coverage and retries larger ranges after no-output", async () => {
 		const prior = observation("cccccccccccc", { sourceEntryIds: ["raw-1"] });
 		const newObs = observation("dddddddddddd", { sourceEntryIds: ["raw-2"] });

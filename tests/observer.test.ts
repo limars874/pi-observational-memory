@@ -198,6 +198,26 @@ describe("runObserver", () => {
 		expect(outcome.observations[0].content).toBe("Kept despite later error");
 	});
 
+	it("passes provider headers and session id to the observer request", async () => {
+		let seenConfig: any;
+		const loop = fakeAgentLoop(async (_prompts, context, config) => {
+			seenConfig = config;
+			await context.tools[0].execute("tool-1", { observations: [] });
+		});
+
+		await runObserver({
+			...baseArgs,
+			headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+			sessionId: "session-123",
+			agentLoop: loop,
+		});
+
+		expect(seenConfig).toMatchObject({
+			headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+			sessionId: "session-123",
+		});
+	});
+
 	it("uses maxTurns as an observer turn cap", async () => {
 		let shouldStopAfterTurn: any;
 		const loop = fakeAgentLoop((_prompts, _context, config) => {

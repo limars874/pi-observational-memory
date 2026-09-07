@@ -201,6 +201,25 @@ describe("V3 dropper agent", () => {
 		await expect(runDropper({ ...baseArgs, targetTokens: 40, agentLoop: loop })).resolves.toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
 	});
 
+	it("passes provider headers and session id to the dropper request", async () => {
+		let seenConfig: any;
+		const loop = fakeAgentLoop((_prompts, _context, config) => {
+			seenConfig = config;
+		});
+
+		await runDropper({
+			...baseArgs,
+			headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+			sessionId: "session-123",
+			agentLoop: loop,
+		});
+
+		expect(seenConfig).toMatchObject({
+			headers: { "x-opencode-session": "session-123", "x-opencode-client": "pi" },
+			sessionId: "session-123",
+		});
+	});
+
 	it("returns undefined when no tool call drops observations", async () => {
 		const loop = fakeAgentLoop(() => {});
 		await expect(runDropper({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
