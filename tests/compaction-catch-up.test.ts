@@ -55,6 +55,9 @@ function setup(args: {
 	observerChunkMaxTokens?: number;
 	consolidationInFlight?: boolean;
 	resolveOk?: boolean;
+	modelProvider?: string;
+	sessionId?: string;
+	resolvedHeaders?: Record<string, string>;
 }) {
 	let entries = [...args.entries];
 	let handler: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
@@ -87,7 +90,12 @@ function setup(args: {
 		consolidationInFlight: args.consolidationInFlight ?? false,
 		resolveModel: vi.fn(async () => (args.resolveOk === false
 			? { ok: false, reason: "no model" }
-			: { ok: true, model: { provider: "gtr7", id: "memory", contextWindow: 65536 }, apiKey: "key" })),
+			: {
+					ok: true,
+					model: { provider: args.modelProvider ?? "gtr7", id: "memory", contextWindow: 65536 },
+					apiKey: "key",
+					headers: args.resolvedHeaders,
+				})),
 		ensureConfig: vi.fn(),
 	};
 	registerCompactionHook(pi as any, runtime as any);
@@ -98,7 +106,10 @@ function setup(args: {
 		ui: { notify: vi.fn() },
 		model: { contextWindow: 65536 },
 		modelRegistry: {},
-		sessionManager: { getBranch: vi.fn(() => entries) },
+		sessionManager: {
+			getBranch: vi.fn(() => entries),
+			getSessionId: vi.fn(() => args.sessionId),
+		},
 	};
 	const run = (firstKeptEntryId: string) => handler!({
 		preparation: { firstKeptEntryId, tokensBefore: 123 },
@@ -141,6 +152,27 @@ describe("compaction hook synchronous catch-up", () => {
 			"info",
 		);
 		expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("keeping them in context"), "info");
+	});
+
+	it("adds OpenCode session headers to the catch-up observer", async () => {
+		const gapObs = observation("cccccccccccc", { sourceEntryIds: ["t1", "a2"], tokenCount: 12 });
+		mockAgents.runObserver.mockResolvedValueOnce([gapObs]);
+		const { run } = setup({
+			entries: laggingBranch(),
+			modelProvider: "opencode-go",
+			sessionId: "catch-up-session",
+			resolvedHeaders: { Authorization: "Bearer test" },
+		});
+
+		await run("u2");
+
+		expect(mockAgents.runObserver).toHaveBeenCalledWith(expect.objectContaining({
+			headers: {
+				Authorization: "Bearer test",
+				"x-opencode-session": "catch-up-session",
+				"x-opencode-client": "pi",
+			},
+		}));
 	});
 
 	it("falls back to retaining the tail when the observer records nothing", async () => {

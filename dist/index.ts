@@ -1946,6 +1946,24 @@ ${userText}`
   return classifyAttempt(secondAttempt.state, secondAttempt.streamError, 2);
 }
 
+// src/hooks/worker-headers.ts
+function workerHeadersFor(ctx, resolved) {
+  const model = resolved.model ?? {};
+  if (model.provider !== "opencode" && model.provider !== "opencode-go" && !(typeof model.baseUrl === "string" && model.baseUrl.includes("opencode.ai"))) {
+    return resolved;
+  }
+  const sessionId = ctx.sessionManager.getSessionId?.();
+  if (!sessionId) return resolved;
+  return {
+    ...resolved,
+    headers: {
+      ...resolved.headers ?? {},
+      "x-opencode-session": sessionId,
+      "x-opencode-client": "pi"
+    }
+  };
+}
+
 // src/hooks/compaction-catch-up.ts
 async function catchUpObserver(args) {
   const { pi, runtime, ctx, entries, gap, maxChunks, signal } = args;
@@ -1961,7 +1979,8 @@ async function catchUpObserver(args) {
     debugLog("compaction.catch_up.model_unavailable", { reason: resolved.reason });
     return { ...result, stoppedBecause: "model_unavailable" };
   }
-  const contextWindow = resolved.model.contextWindow;
+  const worker = workerHeadersFor(ctx, resolved);
+  const contextWindow = worker.model.contextWindow;
   const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
   const frontierIndex = latestObservationCoverageIndex(entries);
   let remaining = entries.slice(frontierIndex + 1, gap.lastIndex + 1).filter(isSourceEntry);
@@ -1983,10 +2002,10 @@ async function catchUpObserver(args) {
     let observations;
     try {
       const outcome = await runObserver({
-        model: resolved.model,
-        apiKey: resolved.apiKey,
-        headers: resolved.headers,
-        env: resolved.env,
+        model: worker.model,
+        apiKey: worker.apiKey,
+        headers: worker.headers,
+        env: worker.env,
         priorReflections: memory.reflections.map(reflectionToSummaryLine),
         priorObservations: memory.observations.map(observationToSummaryLine),
         chunk,
@@ -2917,22 +2936,6 @@ function anyStageDue(entries, runtime, currentTokens) {
 }
 function shouldNotifyWorker(runtime, ctx) {
   return runtime.config.showWorkerNotifications && ctx.hasUI;
-}
-function workerHeadersFor(ctx, resolved) {
-  const model = resolved.model ?? {};
-  if (model.provider !== "opencode" && model.provider !== "opencode-go" && !(typeof model.baseUrl === "string" && model.baseUrl.includes("opencode.ai"))) {
-    return resolved;
-  }
-  const sessionId = ctx.sessionManager.getSessionId?.();
-  if (!sessionId) return resolved;
-  return {
-    ...resolved,
-    headers: {
-      ...resolved.headers ?? {},
-      "x-opencode-session": sessionId,
-      "x-opencode-client": "pi"
-    }
-  };
 }
 function workerThinkingLevel(runtime, resolved) {
   if (resolved.fallbackUsed === true) {

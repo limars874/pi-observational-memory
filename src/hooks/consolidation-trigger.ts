@@ -7,6 +7,7 @@ import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { resolveObserverChunkMaxTokens, resolveWorkerMemoryMaxTokens } from "../config.js";
 import type { ConsolidationPhase, ResolveCtx, ResolveResult, Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
+import { workerHeadersFor } from "./worker-headers.js";
 import {
 	OBSERVER_FAILURE_BACKOFF_BASE_MS,
 	OBSERVER_FAILURE_BACKOFF_MAX_MS,
@@ -158,29 +159,6 @@ function anyStageDue(entries: Entry[], runtime: Runtime, currentTokens: number |
 
 function shouldNotifyWorker(runtime: Runtime, ctx: ConsolidationCtx): boolean {
 	return runtime.config.showWorkerNotifications && ctx.hasUI;
-}
-
-function workerHeadersFor(ctx: ConsolidationCtx, resolved: ResolvedModel): ResolvedModel {
-	// Console Go (opencode.ai) rejects requests without x-opencode-session
-	// (400 MissingSessionID). Mirror pi's own session headers on worker calls.
-	const model = (resolved.model ?? {}) as { provider?: string; baseUrl?: string };
-	if (
-		model.provider !== "opencode"
-		&& model.provider !== "opencode-go"
-		&& !(typeof model.baseUrl === "string" && model.baseUrl.includes("opencode.ai"))
-	) {
-		return resolved;
-	}
-	const sessionId = ctx.sessionManager.getSessionId?.();
-	if (!sessionId) return resolved;
-	return {
-		...resolved,
-		headers: {
-			...(resolved.headers ?? {}),
-			"x-opencode-session": sessionId,
-			"x-opencode-client": "pi",
-		},
-	};
 }
 
 /** Thinking level for the worker call: the fallback's own setting wins when the fallback is active. */

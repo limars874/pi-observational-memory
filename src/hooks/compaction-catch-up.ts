@@ -5,6 +5,7 @@ import { resolveObserverChunkMaxTokens, resolveWorkerMemoryMaxTokens } from "../
 import { debugLog } from "../debug-log.js";
 import type { Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
+import { workerHeadersFor } from "./worker-headers.js";
 import {
 	OM_OBSERVATIONS_RECORDED,
 	OM_OBSERVER_COMPLETED,
@@ -63,7 +64,8 @@ export async function catchUpObserver(args: CatchUpArgs): Promise<CatchUpResult>
 		return { ...result, stoppedBecause: "model_unavailable" };
 	}
 
-	const contextWindow = (resolved.model as { contextWindow?: number }).contextWindow;
+	const worker = workerHeadersFor(ctx, resolved);
+	const contextWindow = (worker.model as { contextWindow?: number }).contextWindow;
 	const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
 	// Start at the global observation frontier, not at the gap (which begins
 	// at the retained-range start). A coverage marker claims everything before
@@ -94,10 +96,10 @@ export async function catchUpObserver(args: CatchUpArgs): Promise<CatchUpResult>
 		let observations;
 		try {
 			const outcome = await runObserver({
-				model: resolved.model as any,
-				apiKey: resolved.apiKey,
-				headers: resolved.headers,
-				env: resolved.env,
+				model: worker.model as any,
+				apiKey: worker.apiKey,
+				headers: worker.headers,
+				env: worker.env,
 				priorReflections: memory.reflections.map(reflectionToSummaryLine),
 				priorObservations: memory.observations.map(observationToSummaryLine),
 				chunk,
